@@ -247,11 +247,13 @@ export default function Studio() {
           ))}
         </div>
         <div className="help">
-          <b>Cmd/Ctrl+V</b> paste · <b>Cmd/Ctrl+S</b> save
+          <b>Cmd/Ctrl+V</b> paste image · <b>Cmd/Ctrl+S</b> save
           <br />
-          <b>Cmd/Ctrl+C/V</b> copy/paste · <b>Cmd/Ctrl+D</b> duplicate
+          <b>Cmd/Ctrl+C</b> copy · <b>Cmd/Ctrl+X</b> cut · <b>Cmd/Ctrl+V</b> paste at cursor · <b>Cmd/Ctrl+D</b> duplicate
           <br />
           <kbd>V</kbd> move · <kbd>M</kbd> box · <kbd>D</kbd> draw · <kbd>W</kbd> ✨magic
+          <br />
+          drag empty = select many · <kbd>Shift</kbd>+drag = lasso · drag a selected one to move all
           <br />
           <kbd>Space</kbd>+drag / scroll to pan · <kbd>Cmd</kbd>+scroll zoom
           <br />

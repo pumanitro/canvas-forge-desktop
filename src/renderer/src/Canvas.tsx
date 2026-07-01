@@ -33,13 +33,20 @@ type Drag =
     }
   | { kind: 'rect'; id: string; sx: number; sy: number }
   | { kind: 'draw'; id: string; lastSx: number; lastSy: number }
-  | { kind: 'band'; sx: number; sy: number; additive: boolean }
+  | { kind: 'band'; sx: number; sy: number; additive: boolean; toggleId?: string }
   | { kind: 'refrect'; id: string; sx: number; sy: number }
   | { kind: 'selresize'; id: string; corner: Corner; ax: number; ay: number }
   | { kind: 'slotmove'; id: string; sx: number; sy: number; ox: number; oy: number }
 
 const MIN_ZOOM = 0.05
 const MAX_ZOOM = 8
+
+// Clipboard + undo history live at MODULE scope so they SURVIVE switching projects.
+// The Canvas is keyed by project.id and remounts per project, but a cut must stay on
+// the clipboard (to paste into another project) and each project's undo stack must
+// persist (so you can switch back and Cmd+Z the cut). Keyed by project id for undo.
+const clipboardStore: { nodes: ImageNode[] } = { nodes: [] }
+const undoStore = new Map<string, ImageNode[][]>()
 
 // crop a region (natural px) of a node's image to a PNG data URL (for references)
 function cropNodeRegion(src: string, bx: number, by: number, bw: number, bh: number): Promise<string> {
@@ -135,6 +142,7 @@ export default function Canvas({
   const [model, setModel] = useState('gemini-3-pro-image')
   const [count, setCount] = useState(1)
   const [extractMode, setExtractMode] = useState<ExtractMode>('isolate') // what the Extract button does
+  const [showHistory, setShowHistory] = useState(false) // recent-prompt chips collapsed by default
   // animated placeholder slots shown while variations generate — MANY jobs at once,
   // each slot tagged with its jobId so concurrent extractions/generations don't clobber.
   // A slot is the SOURCE OF TRUTH for where its result lands: it is placed clear of
@@ -177,12 +185,13 @@ export default function Canvas({
   const viewportRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef<Drag | null>(null)
   const spaceDownRef = useRef(false)
-  const undoRef = useRef<ImageNode[][]>([])
+  // undo history for THIS project, restored from the module store so it survives remounts
+  const undoRef = useRef<ImageNode[][]>(undoStore.get(project.id) ?? [])
   // one AbortController per in-flight job (keyed by jobId) so a job can be cancelled
   // from its own placeholder without touching the other jobs running alongside it.
   const jobAborts = useRef<Map<string, AbortController>>(new Map())
-  const clipboardRef = useRef<ImageNode[]>([]) // in-app copy of nodes (Cmd+C)
   const pasteCountRef = useRef(0) // cascade offset for repeated pastes
+  const mouseClientRef = useRef<{ x: number; y: number } | null>(null) // last cursor pos → paste-at-cursor
 
   useEffect(() => {
     loadPrompts().then(setHistory)
@@ -210,11 +219,13 @@ export default function Canvas({
   const pushHistory = useCallback(() => {
     undoRef.current.push(nodesRef.current)
     if (undoRef.current.length > 60) undoRef.current.shift()
-  }, [])
+    undoStore.set(project.id, undoRef.current) // persist across project switches
+  }, [project.id])
   const undo = useCallback(() => {
     const prev = undoRef.current.pop()
     if (prev) apply(prev)
-  }, [apply])
+    undoStore.set(project.id, undoRef.current)
+  }, [apply, project.id])
 
   const setMarq = useCallback((s: Sel | null) => {
     marqueeRef.current = s
@@ -297,14 +308,26 @@ export default function Canvas({
     [addImage]
   )
 
-  // duplicate / paste node copies (keeps src + prompt metadata), offset & selected
+  // duplicate / paste node copies (keeps src + prompt metadata), selected on arrival.
+  // `world` set → drop the group centered at that point (paste-at-cursor); else cascade-offset.
   const pasteNodes = useCallback(
-    (sources: ImageNode[]) => {
+    (sources: ImageNode[], world?: Pt | null) => {
       if (!sources.length) return
       pushHistory()
-      pasteCountRef.current += 1
-      const dz = (40 / viewRef.current.zoom) * pasteCountRef.current
-      const copies = sources.map((n) => ({ ...n, id: uid(), x: n.x + dz, y: n.y + dz }))
+      let dx: number
+      let dy: number
+      if (world) {
+        const minX = Math.min(...sources.map((n) => n.x))
+        const minY = Math.min(...sources.map((n) => n.y))
+        const maxX = Math.max(...sources.map((n) => n.x + n.w))
+        const maxY = Math.max(...sources.map((n) => n.y + n.h))
+        dx = world.x - (minX + maxX) / 2
+        dy = world.y - (minY + maxY) / 2
+      } else {
+        pasteCountRef.current += 1
+        dx = dy = (40 / viewRef.current.zoom) * pasteCountRef.current
+      }
+      const copies = sources.map((n) => ({ ...n, id: uid(), x: n.x + dx, y: n.y + dy }))
       apply([...nodesRef.current, ...copies])
       const ids = copies.map((c) => c.id)
       setSelectedIds(ids)
@@ -318,28 +341,43 @@ export default function Canvas({
     const onPaste = (e: ClipboardEvent) => {
       const t = document.activeElement?.tagName
       if (t === 'INPUT' || t === 'TEXTAREA') return
-      // an in-app copy takes precedence: duplicate the copied node(s)
-      if (clipboardRef.current.length) {
+      // where the cursor is (for dropping the paste there)
+      const c = mouseClientRef.current
+      const vpEl = viewportRef.current
+      let inVp = false
+      if (c && vpEl) {
+        const r = vpEl.getBoundingClientRect()
+        inVp = c.x >= r.left && c.x <= r.right && c.y >= r.top && c.y <= r.bottom
+      }
+      // 1) A real image on the OS clipboard (screenshot, browser image, file) → add it as
+      //    a NEW image on the canvas. This WINS over the in-app clipboard, so pasting an
+      //    external image always works (previously a lingering in-app cut/copy blocked it).
+      const items = e.clipboardData?.items
+      let imgFile: File | null = null
+      if (items) {
+        for (let i = 0; i < items.length; i++) {
+          if (items[i].type.startsWith('image/')) {
+            imgFile = items[i].getAsFile()
+            break
+          }
+        }
+      }
+      if (imgFile) {
         e.preventDefault()
-        pasteNodes(clipboardRef.current)
+        fileToImage(imgFile, inVp && c ? { x: c.x, y: c.y } : undefined)
+        clipboardStore.nodes = [] // an external image supersedes a stale in-app cut/copy
         return
       }
-      const items = e.clipboardData?.items
-      if (!items) return
-      for (let i = 0; i < items.length; i++) {
-        if (items[i].type.startsWith('image/')) {
-          const f = items[i].getAsFile()
-          if (f) {
-            e.preventDefault()
-            fileToImage(f)
-          }
-          return
-        }
+      // 2) Otherwise, an in-app cut/copy of node(s) → drop the copies at the cursor.
+      if (clipboardStore.nodes.length) {
+        e.preventDefault()
+        const world = inVp && c ? screenToWorld(c.x, c.y) : null
+        pasteNodes(clipboardStore.nodes, world)
       }
     }
     window.addEventListener('paste', onPaste)
     return () => window.removeEventListener('paste', onPaste)
-  }, [fileToImage, pasteNodes])
+  }, [fileToImage, pasteNodes, screenToWorld])
 
   // ---- keyboard ----
   useEffect(() => {
@@ -370,7 +408,7 @@ export default function Canvas({
         if (selectedIds.length) {
           e.preventDefault()
           const set = new Set(selectedIds)
-          clipboardRef.current = nodesRef.current.filter((n) => set.has(n.id)).map((n) => ({ ...n }))
+          clipboardStore.nodes = nodesRef.current.filter((n) => set.has(n.id)).map((n) => ({ ...n }))
           pasteCountRef.current = 0
           // also copy the image itself to the OS clipboard (single selection)
           if (selectedIds.length === 1) {
@@ -381,6 +419,22 @@ export default function Canvas({
               window.setTimeout(() => setCopyToast(null), 1400)
             }
           }
+        }
+        return
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'x') {
+        if (selectedIds.length) {
+          e.preventDefault()
+          const set = new Set(selectedIds)
+          // copy the selection to the in-app clipboard, then remove it (paste re-places it)
+          clipboardStore.nodes = nodesRef.current.filter((n) => set.has(n.id)).map((n) => ({ ...n }))
+          pasteCountRef.current = 0
+          pushHistory()
+          apply(nodesRef.current.filter((n) => !set.has(n.id)))
+          setSelectedIds([])
+          clearSelection()
+          setCopyToast(`Cut ${set.size} image${set.size > 1 ? 's' : ''}. Cmd/Ctrl+V to paste`)
+          window.setTimeout(() => setCopyToast(null), 1800)
         }
         return
       }
@@ -459,6 +513,7 @@ export default function Canvas({
   // ---- window-level pointer move/up (robust: no reliance on pointer capture) ----
   useEffect(() => {
     const onMove = (e: PointerEvent) => {
+      mouseClientRef.current = { x: e.clientX, y: e.clientY }
       if (toolRef.current === 'draw') {
         const r = viewportRef.current?.getBoundingClientRect()
         if (r) {
@@ -595,21 +650,18 @@ export default function Canvas({
         setRefPick(false)
       } else if (drag.kind === 'band') {
         const b = bandRef.current
-        if (b) {
+        const tiny = !b || (b.w * z < 6 && b.h * z < 6)
+        if (drag.toggleId && tiny) {
+          // shift-click on a frame with no drag → toggle just that frame
+          const cur = selectedIdsRef.current
+          setSelectedIds(cur.includes(drag.toggleId) ? cur.filter((id) => id !== drag.toggleId) : [...cur, drag.toggleId])
+        } else if (b) {
           const hit = nodesRef.current
             .filter((n) => n.x < b.x + b.w && n.x + n.w > b.x && n.y < b.y + b.h && n.y + n.h > b.y)
             .map((n) => n.id)
           setSelectedIds(drag.additive ? Array.from(new Set([...selectedIdsRef.current, ...hit])) : hit)
         }
         setBandSync(null)
-      } else if (drag.kind === 'move' && !drag.pushed && drag.ids.length === 1) {
-        // a plain click (no move) on a single frame → select the WHOLE frame edge-to-edge
-        // and open the popover, so Extract/Generate run on every pixel (no hand-drawn box).
-        const n = nodesRef.current.find((x) => x.id === drag.ids[0])
-        if (n) {
-          setSelection({ imgId: n.id, x: n.x, y: n.y, w: n.w, h: n.h })
-          setErr(null)
-        }
       }
     }
     window.addEventListener('pointermove', onMove)
@@ -694,10 +746,10 @@ export default function Canvas({
     } else {
       e.stopPropagation()
       if (e.shiftKey || e.metaKey) {
-        const has = selectedIds.includes(node.id)
-        const ids = has ? selectedIds.filter((id) => id !== node.id) : [...selectedIds, node.id]
-        setSelectedIds(ids)
-        if (!has) startMove(e, ids, w)
+        // Shift/Cmd on a frame: start an ADDITIVE rubber-band (lasso) so you can select
+        // several even when frames are packed. A shift-CLICK with no drag toggles this one.
+        setBandSync({ x: w.x, y: w.y, w: 0, h: 0 })
+        beginDrag(e, { kind: 'band', sx: w.x, sy: w.y, additive: true, toggleId: node.id })
       } else {
         const ids = selectedIds.includes(node.id) && selectedIds.length > 1 ? selectedIds : [node.id]
         setSelectedIds(ids)
@@ -1123,6 +1175,14 @@ export default function Canvas({
             className={'node' + (selectedIds.includes(n.id) ? ' selected' : '') + (revealIds.includes(n.id) ? ' reveal' : '') + (n.transparent ? ' transparent' : '')}
             style={{ left: n.x, top: n.y, width: n.w, height: n.h }}
             onPointerDown={(e) => onNodePointerDown(e, n)}
+            onDoubleClick={() => {
+              // double-click = select the WHOLE frame edge-to-edge + open the popover
+              // (single click just moves it around)
+              if (tool !== 'move') return
+              setSelectedIds([n.id])
+              setSelection(fullFrame(n))
+              setErr(null)
+            }}
             onAnimationEnd={() => revealIds.includes(n.id) && setRevealIds((r) => r.filter((id) => id !== n.id))}
           >
             {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -1276,14 +1336,21 @@ export default function Canvas({
                 }
               }}
             />
-            <div className="prompt-tip">Tip: cover only what you want changed — any text under the selection gets redrawn.</div>
+            <div className="prompt-tip">Tip: cover only what you want changed. Any text under the selection gets redrawn.</div>
             {history.length ? (
-              <div className="prompt-chips">
-                {history.slice(0, 6).map((p) => (
-                  <button key={p} className="chip" title={p} onClick={() => setPromptText(p)}>
-                    {p.length > 28 ? p.slice(0, 27) + '…' : p}
-                  </button>
-                ))}
+              <div className="prompt-history">
+                <button className="ph-toggle" onClick={() => setShowHistory((v) => !v)} title="Reuse a recent prompt">
+                  {showHistory ? '▾' : '▸'} Recent prompts
+                </button>
+                {showHistory ? (
+                  <div className="prompt-chips">
+                    {history.slice(0, 6).map((p) => (
+                      <button key={p} className="chip" title={p} onClick={() => setPromptText(p)}>
+                        {p.length > 28 ? p.slice(0, 27) + '…' : p}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             ) : null}
             {err ? <div className="prompt-err">{err}</div> : null}
@@ -1329,6 +1396,11 @@ export default function Canvas({
                   ))}
                 </select>
               </label>
+            </div>
+            <div className="prompt-tip extract-hint">
+              {extractMode === 'background'
+                ? 'Extract → Background only: deletes the panels, icons and text and keeps just the scene behind them (opaque). Best on the whole frame.'
+                : 'Extract → Isolate element: cuts the one element you name out on a transparent background (text removed).'}
             </div>
             <div className="prompt-actions">
               <button className="btn" onClick={cancelPrompt}>

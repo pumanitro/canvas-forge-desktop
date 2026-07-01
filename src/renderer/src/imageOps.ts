@@ -124,11 +124,12 @@ function keyOutMagenta(ctx: CanvasRenderingContext2D, w: number, h: number): voi
 function bgExtractPrompt(userPrompt?: string): string {
   const what = userPrompt?.trim() ? ` The background to keep is: "${userPrompt.trim()}".` : ''
   return [
-    'You are a precise background-extraction tool.',
-    'From this image, REMOVE every foreground element (icons, buttons, panels, badges, UI widgets, characters, objects) and ALL text, numbers and labels.',
-    'Reconstruct and KEEP ONLY the background scene or surface that sits behind them, plausibly filling in the areas the removed elements covered so the background is complete, continuous and seamless.' + what,
-    'Preserve the background exactly where it is already visible: same style, perspective, lighting, palette, materials and framing. Do not add any new objects or text.',
-    'Output an opaque image at the SAME pixel dimensions and framing as the input.'
+    'You are a precise background-extraction and cleanup tool.',
+    'COMPLETELY REMOVE every foreground element from this image: all panels, cards, list rows, bars, scrollbars, frames, plaques, badges, buttons, icons, widgets, characters and objects, plus ALL text, numbers and labels.',
+    'Repaint the ENTIRE area they covered with a natural, continuous extension of the BACKGROUND scene or surface that sits behind them, as if those elements had never been there (inpaint the walls, floor, sky, texture, etc. straight through).' + what,
+    'Leave NO trace of the removed elements: no ghost, no faint silhouette, no outline, no rectangle, no darker/lighter patch, no leftover edge or seam. The result must read as a clean, complete standalone background image.',
+    'Keep the parts of the background that are already visible exactly as-is: same art style, perspective, lighting, palette, materials and framing. Do not add any new objects, characters or text.',
+    'Output an OPAQUE image at the SAME pixel dimensions and framing as the input.'
   ].join('\n')
 }
 function extractPrompt(userPrompt?: string): string {
