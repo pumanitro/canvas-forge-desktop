@@ -809,8 +809,9 @@ export default function Canvas({
       baseX: number
       baseY: number
       colW: number
+      count?: number // override the Runs setting (e.g. Remove BG is always a single run)
     }) => {
-      const N = clamp(count, 1, 10)
+      const N = clamp(params.count ?? count, 1, 10)
       const jobId = uid()
       const ac = new AbortController()
       jobAborts.current.set(jobId, ac)
@@ -971,6 +972,7 @@ export default function Canvas({
         baseX: n.x + n.w + gap,
         baseY: n.y,
         colW: n.w + gap,
+        count: 1, // Remove BG is deterministic: always a single result, ignore the Runs setting
       })
     },
     [model, runGeneration]
