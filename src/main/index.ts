@@ -69,6 +69,56 @@ function buildAppMenu(): void {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
+// --- minimal ZIP writer (STORE method; PNGs are already compressed) — no dependency ---
+function crc32(buf: Buffer): number {
+  let crc = 0xffffffff
+  for (let i = 0; i < buf.length; i++) {
+    let c = (crc ^ buf[i]) & 0xff
+    for (let k = 0; k < 8; k++) c = c & 1 ? (c >>> 1) ^ 0xedb88320 : c >>> 1
+    crc = (crc >>> 8) ^ c
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+function makeZip(files: { name: string; data: Buffer }[]): Buffer {
+  const local: Buffer[] = []
+  const central: Buffer[] = []
+  let offset = 0
+  for (const f of files) {
+    const nameBuf = Buffer.from(f.name, 'utf8')
+    const crc = crc32(f.data)
+    const size = f.data.length
+    const lh = Buffer.alloc(30)
+    lh.writeUInt32LE(0x04034b50, 0)
+    lh.writeUInt16LE(20, 4)
+    lh.writeUInt16LE(0, 8) // method 0 = store
+    lh.writeUInt32LE(crc, 14)
+    lh.writeUInt32LE(size, 18)
+    lh.writeUInt32LE(size, 22)
+    lh.writeUInt16LE(nameBuf.length, 26)
+    local.push(lh, nameBuf, f.data)
+    const ch = Buffer.alloc(46)
+    ch.writeUInt32LE(0x02014b50, 0)
+    ch.writeUInt16LE(20, 4)
+    ch.writeUInt16LE(20, 6)
+    ch.writeUInt16LE(0, 10)
+    ch.writeUInt32LE(crc, 16)
+    ch.writeUInt32LE(size, 20)
+    ch.writeUInt32LE(size, 24)
+    ch.writeUInt16LE(nameBuf.length, 28)
+    ch.writeUInt32LE(offset, 42)
+    central.push(ch, nameBuf)
+    offset += lh.length + nameBuf.length + size
+  }
+  const centralBuf = Buffer.concat(central)
+  const eocd = Buffer.alloc(22)
+  eocd.writeUInt32LE(0x06054b50, 0)
+  eocd.writeUInt16LE(files.length, 8)
+  eocd.writeUInt16LE(files.length, 10)
+  eocd.writeUInt32LE(centralBuf.length, 12)
+  eocd.writeUInt32LE(offset, 16)
+  return Buffer.concat([...local, centralBuf, eocd])
+}
+
 function registerIpc(): void {
   // --- Gemini (never exposes the key to the renderer) ---
   ipcMain.handle('gemini:generate', async (_e, opts: { prompt: string; images: string[]; model: string }) => {
@@ -158,6 +208,31 @@ function registerIpc(): void {
     if (canceled || !filePath) return { canceled: true }
     writeFileSync(filePath, Buffer.from(m[1], 'base64'))
     return { path: filePath }
+  })
+
+  // bulk export: bundle N images (data URLs) into a single .zip of PNGs
+  ipcMain.handle('image:exportZip', async (_e, { items, name }: { items: { name: string; dataUrl: string }[]; name: string }) => {
+    const files: { name: string; data: Buffer }[] = []
+    const used = new Set<string>()
+    items.forEach((it, i) => {
+      const m = it.dataUrl.match(/^data:image\/\w+;base64,([\s\S]*)$/)
+      if (!m) return
+      const base = ((it.name || '').replace(/[^a-z0-9-_ ]/gi, '_').trim().slice(0, 60) || `image-${i + 1}`)
+      let fname = `${base}.png`
+      let n = 2
+      while (used.has(fname.toLowerCase())) fname = `${base}-${n++}.png`
+      used.add(fname.toLowerCase())
+      files.push({ name: fname, data: Buffer.from(m[1], 'base64') })
+    })
+    if (!files.length) return { error: 'nothing to export' }
+    const { canceled, filePath } = await dialog.showSaveDialog({
+      title: 'Export selected images as ZIP',
+      defaultPath: `${(name || 'canvas-forge').replace(/[^a-z0-9-_ ]/gi, '_')}.zip`,
+      filters: [{ name: 'ZIP archive', extensions: ['zip'] }]
+    })
+    if (canceled || !filePath) return { canceled: true }
+    writeFileSync(filePath, makeZip(files))
+    return { path: filePath, count: files.length }
   })
 
   // reveal a saved file in Finder / Explorer (highlights it in its folder)

@@ -1121,6 +1121,26 @@ export default function Canvas({
     }
   }
 
+  // Bulk export: bundle every selected image into one .zip of PNGs.
+  const exportSelectedZip = async (): Promise<void> => {
+    const set = new Set(selectedIdsRef.current)
+    const sel = nodesRef.current.filter((n) => set.has(n.id))
+    if (!sel.length) return
+    const items = sel.map((n, i) => ({ name: n.prompt ? n.prompt.slice(0, 50) : `image-${i + 1}`, dataUrl: n.src }))
+    const r = await window.api.exportZip(items, project.name || 'canvas-forge')
+    if (r?.canceled) return
+    if (r?.error) {
+      setCopyToast(r.error)
+      window.setTimeout(() => setCopyToast(null), 4000)
+      return
+    }
+    if (r?.path) {
+      setSavedPath(r.path)
+      if (savedTimer.current) clearTimeout(savedTimer.current)
+      savedTimer.current = setTimeout(() => setSavedPath(null), 8000)
+    }
+  }
+
   const fullFrame = (n: ImageNode): Sel => ({ imgId: n.id, x: n.x, y: n.y, w: n.w, h: n.h })
   const openMagicFor = (n: ImageNode): void => {
     const s = w2s(n.x + n.w / 2, n.y)
@@ -1488,6 +1508,9 @@ export default function Canvas({
           <>
             <div className="sep" />
             <span className="sel-count">{selectedIds.length} selected</span>
+            <button className="tbtn" title="Export all selected images as a .zip of PNGs" onClick={exportSelectedZip}>
+              Export ZIP
+            </button>
             <button
               className="tbtn danger"
               title="Delete selected (Delete)"

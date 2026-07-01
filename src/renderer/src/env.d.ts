@@ -17,6 +17,7 @@ declare global {
       importProject: () => Promise<{ project?: Project; canceled?: boolean; error?: string }>
       savePng: (dataUrl: string, name: string) => Promise<{ path?: string; canceled?: boolean; error?: string }>
       revealItem: (path: string) => Promise<{ ok?: boolean }>
+      exportZip: (items: { name: string; dataUrl: string }[], name: string) => Promise<{ path?: string; count?: number; canceled?: boolean; error?: string }>
       copyImage: (dataUrl: string) => Promise<{ ok?: boolean; error?: string }>
       detect: (opts: { image: string; description: string }) => Promise<{ box?: [number, number, number, number] | null; error?: string }>
     }

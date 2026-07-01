@@ -16,6 +16,8 @@ const api = {
   savePng: (dataUrl: string, name: string) =>
     ipcRenderer.invoke('image:savePng', { dataUrl, name }) as Promise<{ path?: string; canceled?: boolean; error?: string }>,
   revealItem: (path: string) => ipcRenderer.invoke('shell:showItem', path) as Promise<{ ok?: boolean }>,
+  exportZip: (items: { name: string; dataUrl: string }[], name: string) =>
+    ipcRenderer.invoke('image:exportZip', { items, name }) as Promise<{ path?: string; count?: number; canceled?: boolean; error?: string }>,
   copyImage: (dataUrl: string) => ipcRenderer.invoke('clipboard:writeImage', dataUrl) as Promise<{ ok?: boolean; error?: string }>,
   detect: (opts: { image: string; description: string }) =>
     ipcRenderer.invoke('gemini:detect', opts) as Promise<{ box?: [number, number, number, number] | null; error?: string }>
