@@ -306,13 +306,16 @@ button {
   outline: 2px solid var(--accent);
   outline-offset: 0;
 }
-/* extracted (transparent) cutouts: show a checkerboard so transparency is obvious */
+/* extracted (transparent) cutouts: REAL see-through compositing — no backing plate or
+   shadow (a checkerboard/shadow here would block whatever the cutout sits on top of).
+   The Layers-panel thumbnails keep a checkerboard so cutouts stay recognizable. */
 .node.transparent {
-  background-color: #14161c;
-  background-image: linear-gradient(45deg, rgba(255, 255, 255, 0.06) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.06) 75%),
-    linear-gradient(45deg, rgba(255, 255, 255, 0.06) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.06) 75%);
-  background-size: 14px 14px;
-  background-position: 0 0, 7px 7px;
+  background: none;
+  box-shadow: none;
+}
+.node.transparent:hover {
+  outline: 1px dashed rgba(255, 255, 255, 0.28);
+  outline-offset: 0;
 }
 
 /* Screen-space overlay (handles, marquee, prompt) — not transformed. */
@@ -1028,6 +1031,176 @@ button {
     opacity: 0;
     transform: translate(-50%, 6px);
   }
+}
+
+/* ---- Figma-style Layers panel: docks as a SECOND column right of the project pane,
+   so projects and layers are visible together. Hidden by default (edge tab). ---- */
+.layers-panel {
+  position: fixed;
+  left: 220px;
+  top: 0;
+  bottom: 0;
+  width: 220px;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel, #101116);
+  border-right: 1px solid var(--line);
+  box-shadow: 6px 0 24px rgba(0, 0, 0, 0.45);
+  z-index: 30;
+  overflow: hidden;
+}
+.lp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--line);
+}
+.lp-x {
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.lp-x:hover {
+  color: #fff;
+}
+.lp-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 6px;
+}
+.lp-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 6px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text);
+}
+.lp-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.lp-row.sel {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.lp-row.off .lp-thumb,
+.lp-row.off .lp-name {
+  opacity: 0.38;
+}
+.lp-eye {
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0;
+  width: 16px;
+  flex: 0 0 auto;
+}
+.lp-eye:hover {
+  color: #fff;
+}
+.lp-thumb {
+  width: 26px;
+  height: 20px;
+  flex: 0 0 auto;
+  border-radius: 4px;
+  overflow: hidden;
+  background:
+    linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%),
+    #0a0b0f;
+  background-size: 8px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.lp-thumb img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+.lp-name {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lp-name-input {
+  flex: 1;
+  min-width: 0;
+  background: #0a0b0f;
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 2px 6px;
+  outline: none;
+}
+.lp-z {
+  display: none;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+.lp-row:hover .lp-z {
+  display: flex;
+}
+.lp-z button {
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 9px;
+  padding: 2px 3px;
+}
+.lp-z button:hover {
+  color: #fff;
+}
+.lp-tip {
+  padding: 7px 12px;
+  font-size: 10.5px;
+  color: var(--muted);
+  border-top: 1px solid var(--line);
+}
+/* Layers toggle: a vertical tab pinned to the sidebar's RIGHT edge — always visible,
+   sticking out over the sidebar/canvas boundary. Expands/collapses the panel. */
+.layers-tab {
+  position: fixed;
+  left: 220px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 31;
+  writing-mode: vertical-rl;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #1b1d26;
+  border: 1px solid var(--line);
+  border-left: none;
+  border-radius: 0 9px 9px 0;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  padding: 12px 5px;
+  cursor: pointer;
+  box-shadow: 3px 0 14px rgba(0, 0, 0, 0.45);
+}
+.layers-tab:hover {
+  border-color: var(--accent);
+  color: #fff;
+  background: color-mix(in srgb, var(--accent) 16%, #1b1d26);
+}
+.layers-tab.open {
+  border-color: var(--accent);
+  left: 440px; /* rides out to the docked panel's edge */
 }
 
 /* Save-PNG confirmation toast with a "Reveal in Finder" action */

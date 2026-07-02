@@ -15,6 +15,8 @@ export type ImageNode = {
   model?: string // the model used to generate it
   createdAt?: number // epoch ms when it was generated
   transparent?: boolean // true for Extract results (transparent-background cutout)
+  name?: string // user-given layer name (Layers panel)
+  hidden?: boolean // hidden layers don't render and are skipped by band-select / Cmd+A
 }
 
 export type Project = {

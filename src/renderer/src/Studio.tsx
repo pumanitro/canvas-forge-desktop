@@ -251,7 +251,7 @@ export default function Studio() {
           <br />
           <b>Cmd/Ctrl+C</b> copy · <b>Cmd/Ctrl+X</b> cut · <b>Cmd/Ctrl+V</b> paste at cursor · <b>Cmd/Ctrl+D</b> duplicate
           <br />
-          <kbd>V</kbd> move · <kbd>M</kbd> box · <kbd>D</kbd> draw · <kbd>W</kbd> ✨magic
+          <kbd>V</kbd> move · <kbd>M</kbd> box · <kbd>D</kbd> draw · <kbd>W</kbd> ✨magic · <b>☰</b> layers
           <br />
           drag empty = select many · <kbd>Shift</kbd>+drag = lasso · drag a selected one to move all
           <br />

@@ -1,5 +1,5 @@
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { ImageNode, Project } from './types'
 import { clamp, uid } from './util'
 import { addPrompt, loadPrompts } from './store'
@@ -19,7 +19,7 @@ type PendingSlot = { id: string; jobId: string; label: string; x: number; y: num
 
 type Drag =
   | { kind: 'pan'; sx: number; sy: number; ox: number; oy: number }
-  | { kind: 'move'; ids: string[]; starts: { id: string; x: number; y: number }[]; sx: number; sy: number; pushed: boolean }
+  | { kind: 'move'; ids: string[]; starts: { id: string; x: number; y: number }[]; sx: number; sy: number; pushed: boolean; toggleOff?: string }
   | {
       kind: 'resize'
       id: string
@@ -143,6 +143,9 @@ export default function Canvas({
   const [count, setCount] = useState(1)
   const [extractMode, setExtractMode] = useState<ExtractMode>('isolate') // what the Extract button does
   const [showHistory, setShowHistory] = useState(false) // recent-prompt chips collapsed by default
+  // Figma-style Layers panel: hidden by default, toggled from the toolbar (or L)
+  const [layersOpen, setLayersOpen] = useState(false)
+  const [renamingLayer, setRenamingLayer] = useState<string | null>(null)
   // animated placeholder slots shown while variations generate — MANY jobs at once,
   // each slot tagged with its jobId so concurrent extractions/generations don't clobber.
   // A slot is the SOURCE OF TRUTH for where its result lands: it is placed clear of
@@ -400,7 +403,7 @@ export default function Canvas({
       }
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'a') {
         e.preventDefault()
-        setSelectedIds(nodesRef.current.map((n) => n.id))
+        setSelectedIds(nodesRef.current.filter((n) => !n.hidden).map((n) => n.id))
         clearSelection()
         return
       }
@@ -657,11 +660,14 @@ export default function Canvas({
           setSelectedIds(cur.includes(drag.toggleId) ? cur.filter((id) => id !== drag.toggleId) : [...cur, drag.toggleId])
         } else if (b) {
           const hit = nodesRef.current
-            .filter((n) => n.x < b.x + b.w && n.x + n.w > b.x && n.y < b.y + b.h && n.y + n.h > b.y)
+            .filter((n) => !n.hidden && n.x < b.x + b.w && n.x + n.w > b.x && n.y < b.y + b.h && n.y + n.h > b.y)
             .map((n) => n.id)
           setSelectedIds(drag.additive ? Array.from(new Set([...selectedIdsRef.current, ...hit])) : hit)
         }
         setBandSync(null)
+      } else if (drag.kind === 'move' && !drag.pushed && drag.toggleOff) {
+        // shift-click (no movement) on a selected frame → deselect just that frame
+        setSelectedIds(selectedIdsRef.current.filter((id) => id !== drag.toggleOff))
       }
     }
     window.addEventListener('pointermove', onMove)
@@ -746,10 +752,19 @@ export default function Canvas({
     } else {
       e.stopPropagation()
       if (e.shiftKey || e.metaKey) {
-        // Shift/Cmd on a frame: start an ADDITIVE rubber-band (lasso) so you can select
-        // several even when frames are packed. A shift-CLICK with no drag toggles this one.
-        setBandSync({ x: w.x, y: w.y, w: 0, h: 0 })
-        beginDrag(e, { kind: 'band', sx: w.x, sy: w.y, additive: true, toggleId: node.id })
+        if (selectedIds.includes(node.id)) {
+          // Shift on an ALREADY-SELECTED frame: drag moves the whole selected group
+          // (so Shift+click A, Shift+click B, Shift+drag works); a plain shift-click
+          // with no drag deselects just this frame.
+          const idset = new Set(selectedIds)
+          const starts = nodesRef.current.filter((n) => idset.has(n.id)).map((n) => ({ id: n.id, x: n.x, y: n.y }))
+          beginDrag(e, { kind: 'move', ids: selectedIds, starts, sx: w.x, sy: w.y, pushed: false, toggleOff: node.id })
+        } else {
+          // Shift on an unselected frame: start an ADDITIVE rubber-band (lasso); a
+          // shift-CLICK with no drag adds this one to the selection.
+          setBandSync({ x: w.x, y: w.y, w: 0, h: 0 })
+          beginDrag(e, { kind: 'band', sx: w.x, sy: w.y, additive: true, toggleId: node.id })
+        }
       } else {
         const ids = selectedIds.includes(node.id) && selectedIds.length > 1 ? selectedIds : [node.id]
         setSelectedIds(ids)
@@ -901,13 +916,14 @@ export default function Canvas({
     const refs = references.map((r) => r.src)
     const prompt = promptText
     const mdl = model
+    const transparent = node.transparent
     const gap = Math.max(24, node.w * 0.05)
     runGeneration({
-      perform: () => imageEdit({ src, bbox, prompt, model: mdl, stroke: strokeReq, references: refs }),
+      perform: () => imageEdit({ src, bbox, prompt, model: mdl, stroke: strokeReq, references: refs, transparent }),
       prompt,
       action: 'edit',
       model: mdl,
-      res: { w: node.w, h: node.h, nW: node.nW, nH: node.nH },
+      res: { w: node.w, h: node.h, nW: node.nW, nH: node.nH, transparent },
       baseX: node.x + node.w + gap,
       baseY: node.y,
       colW: node.w + gap,
@@ -1108,6 +1124,32 @@ export default function Canvas({
   const cursorClass = refPick ? 'select' : panning ? 'panning' : spaceMode ? 'pan' : tool === 'rect' || tool === 'magic' ? 'select' : tool === 'draw' ? 'draw' : ''
 
   // treat a whole image node as a full-frame selection (for Edit/Extract on the frame)
+  // ---- Layers panel helpers ----
+  // Render order = array order (later = on top). Bring forward / send backward.
+  const moveZ = (id: string, dir: 1 | -1): void => {
+    const arr = [...nodesRef.current]
+    const i = arr.findIndex((n) => n.id === id)
+    const j = i + dir
+    if (i < 0 || j < 0 || j >= arr.length) return
+    pushHistory()
+    ;[arr[i], arr[j]] = [arr[j], arr[i]]
+    apply(arr)
+  }
+  const layerName = (n: ImageNode, idx: number): string =>
+    n.name || (n.prompt ? n.prompt.slice(0, 26) : n.transparent ? `Cutout ${idx + 1}` : `Image ${idx + 1}`)
+  // Figma-like nesting from geometry: a node's parent is the SMALLEST other node that
+  // contains ≥85% of its area (an extracted key sitting on a frame nests under it).
+  const layerParent = (n: ImageNode, all: ImageNode[]): ImageNode | null => {
+    let best: ImageNode | null = null
+    for (const o of all) {
+      if (o.id === n.id || o.w * o.h <= n.w * n.h) continue
+      const ix = Math.max(0, Math.min(n.x + n.w, o.x + o.w) - Math.max(n.x, o.x))
+      const iy = Math.max(0, Math.min(n.y + n.h, o.y + o.h) - Math.max(n.y, o.y))
+      if (ix * iy >= 0.85 * n.w * n.h && (!best || o.w * o.h < best.w * best.h)) best = o
+    }
+    return best
+  }
+
   const savePngFor = async (n: ImageNode): Promise<void> => {
     const r = await window.api.savePng(n.src, n.prompt || 'canvas-forge')
     if (r?.canceled) return
@@ -1191,7 +1233,7 @@ export default function Canvas({
       }}
     >
       <div className="world" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})` }}>
-        {nodes.map((n) => (
+        {nodes.filter((n) => !n.hidden).map((n) => (
           <div
             key={n.id}
             className={'node' + (selectedIds.includes(n.id) ? ' selected' : '') + (revealIds.includes(n.id) ? ' reveal' : '') + (n.transparent ? ' transparent' : '')}
@@ -1571,6 +1613,98 @@ export default function Canvas({
           </div>
         </div>
       ) : null}
+
+      {layersOpen
+        ? (() => {
+            // Figma-style layer tree: topmost first; spatial containment = nesting.
+            const parentId = new Map<string, string | null>()
+            nodes.forEach((n) => parentId.set(n.id, layerParent(n, nodes)?.id ?? null))
+            const childrenOf = (id: string | null): ImageNode[] =>
+              nodes.filter((n) => parentId.get(n.id) === id).reverse() // later in array = on top = first in list
+            const row = (n: ImageNode, depth: number): ReactNode => {
+              const idx = nodes.findIndex((x) => x.id === n.id)
+              const kids = childrenOf(n.id)
+              return (
+                <div key={n.id}>
+                  <div
+                    className={'lp-row' + (selectedIds.includes(n.id) ? ' sel' : '') + (n.hidden ? ' off' : '')}
+                    style={{ paddingLeft: 8 + depth * 16 }}
+                    onClick={() => {
+                      setSelectedIds([n.id])
+                      clearSelection()
+                    }}
+                  >
+                    <button
+                      className="lp-eye"
+                      title={n.hidden ? 'Show layer' : 'Hide layer'}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        pushHistory()
+                        updateNode(n.id, { hidden: !n.hidden })
+                      }}
+                    >
+                      {n.hidden ? '◌' : '◉'}
+                    </button>
+                    <span className="lp-thumb">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={n.src} alt="" />
+                    </span>
+                    {renamingLayer === n.id ? (
+                      <input
+                        className="lp-name-input"
+                        autoFocus
+                        defaultValue={n.name || ''}
+                        placeholder={layerName(n, idx)}
+                        onClick={(e) => e.stopPropagation()}
+                        onBlur={(e) => {
+                          updateNode(n.id, { name: e.target.value.trim() || undefined })
+                          setRenamingLayer(null)
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+                          if (e.key === 'Escape') setRenamingLayer(null)
+                        }}
+                      />
+                    ) : (
+                      <span className="lp-name" title="Double-click to rename" onDoubleClick={() => setRenamingLayer(n.id)}>
+                        {layerName(n, idx)}
+                      </span>
+                    )}
+                    <span className="lp-z">
+                      <button title="Bring forward" onClick={(e) => { e.stopPropagation(); moveZ(n.id, 1) }}>
+                        ▲
+                      </button>
+                      <button title="Send backward" onClick={(e) => { e.stopPropagation(); moveZ(n.id, -1) }}>
+                        ▼
+                      </button>
+                    </span>
+                  </div>
+                  {kids.map((k) => row(k, depth + 1))}
+                </div>
+              )
+            }
+            return (
+              <div className="layers-panel" onPointerDown={(e) => e.stopPropagation()}>
+                <div className="lp-head">
+                  <span>☰ Layers</span>
+                  <button className="lp-x" title="Collapse" onClick={() => setLayersOpen(false)}>
+                    ▾
+                  </button>
+                </div>
+                <div className="lp-list">{childrenOf(null).map((n) => row(n, 0))}</div>
+                <div className="lp-tip">Click selects · double-click renames · ▲▼ reorder · ◉ show/hide</div>
+              </div>
+            )
+          })()
+        : null}
+      <button
+        className={'layers-tab' + (layersOpen ? ' open' : '')}
+        title={layersOpen ? 'Collapse the Layers panel' : 'Expand the Layers panel'}
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={() => setLayersOpen((v) => !v)}
+      >
+        {layersOpen ? '◂' : '▸'} ☰ Layers
+      </button>
 
       {copyToast ? <div className="toast">{copyToast}</div> : null}
       {savedPath ? (
