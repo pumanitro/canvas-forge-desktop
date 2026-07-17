@@ -3,10 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <title>Electron</title>
-    <!-- https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP -->
+    <!-- https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP
+         'wasm-unsafe-eval' is required by Remove BG (Precise): ONNX Runtime compiles its
+         inference engine from WebAssembly, and a bare `script-src 'self'` blocks that — the
+         compile throws and ORT reports the misleading "no available backend found". This is
+         the narrow directive: it permits WebAssembly only, and still forbids JS eval(). -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:"
     />
   </head>
 

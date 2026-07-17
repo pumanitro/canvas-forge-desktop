@@ -8,3 +8,6 @@ out
 # secrets
 .env
 .env.local
+
+# ORT runtime, staged into public/ by scripts/copy-ort-runtime.mjs (predev / prebuild)
+src/renderer/public/ort

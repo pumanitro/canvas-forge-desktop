@@ -1,22 +1,41 @@
 // Precise background removal via a real image-matting network (U²-Net), run LOCALLY in the renderer
-// with ONNX Runtime Web (WebGPU when available, WASM fallback). Unlike the generative "AI" mode
-// (which repaints the background magenta) this is a purpose-built segmentation/matting model — the
-// same class of tool Figma/Photoroom use: it predicts a per-pixel foreground alpha with soft edges
-// and never regenerates or reframes the image. We apply that alpha to the pristine original.
+// with ONNX Runtime Web on the WASM (SIMD) CPU backend. Unlike the generative "AI" mode (which
+// repaints the background magenta) this is a purpose-built segmentation/matting model — the same
+// class of tool Figma/Photoroom use: it predicts a per-pixel foreground alpha with soft edges and
+// never regenerates or reframes the image. We apply that alpha to the pristine original.
 import * as ort from 'onnxruntime-web'
 import modelUrl from './models/u2netp.onnx?url'
 
-// The renderer can't fetch external URLs, so ORT must load its WASM from the SAME-ORIGIN copy the
-// bundler emits (ONNX references it via `new URL(..., import.meta.url)`, which Vite rewrites to a
-// local asset). We therefore leave `wasmPaths` unset. Single thread avoids the cross-origin-
-// isolation (COOP/COEP) requirement of threaded WASM; WebGPU does the heavy compute when present.
+// ORT's inference engine ships as two runtime files it fetches lazily: the .wasm binary and its
+// .mjs Emscripten loader glue. Left to itself ORT resolves them relative to its OWN bundled module
+// (in dev, `/node_modules/.vite/deps/…`) — a path the dev server doesn't have, so it returns the
+// SPA fallback HTML and the wasm compile dies with "expected magic word … found 3c 21 64 6f"
+// (`<!do`, i.e. `<!doctype html>`). We can't fix that with a `?url` import either: Vite's built-in
+// `.wasm` handling intercepts it and hands back a JS wrapper, not the binary.
+//
+// So the two files live in the renderer's `public/ort/` — copied verbatim into the build, never
+// run through Vite's module pipeline — and we hand ORT absolute URLs built from `document.baseURI`.
+// That base is the directory of index.html, which resolves correctly in BOTH worlds: dev
+// (`http://localhost:6771/ort/…`) and the packaged file:// renderer (`…/out/renderer/ort/…`), with
+// no dependence on ORT's own module location.
+const ortBase = new URL('ort/', document.baseURI)
+
+// Single thread avoids the cross-origin-isolation (COOP/COEP) requirement of threaded WASM. We ship
+// the JSEP build's runtime files (they also serve plain WASM), but run on the WASM CPU EP, not
+// WebGPU: u2netp's MaxPool uses ceil_mode, which the WebGPU provider can't compute ("using ceil()
+// in shape computation is not yet supported for MaxPool") and it errors at inference rather than
+// falling back. On the CPU EP the op is supported, and a 4.5 MB net at 320×320 runs fast anyway.
 ort.env.wasm.numThreads = 1
+ort.env.wasm.wasmPaths = {
+  wasm: new URL('ort-wasm-simd-threaded.jsep.wasm', ortBase).href,
+  mjs: new URL('ort-wasm-simd-threaded.jsep.mjs', ortBase).href
+}
 
 let sessionP: Promise<ort.InferenceSession> | null = null
 function session(): Promise<ort.InferenceSession> {
   if (!sessionP) {
     sessionP = ort.InferenceSession.create(modelUrl, {
-      executionProviders: ['webgpu', 'wasm']
+      executionProviders: ['wasm']
     })
   }
   return sessionP
