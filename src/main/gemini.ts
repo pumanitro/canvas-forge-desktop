@@ -113,17 +113,27 @@ export async function geminiDetect(opts: {
 }
 
 // images: array of data URLs. Returns a PNG data URL, or throws.
+// aspectRatio (e.g. '9:16') pins the output shape at the API level. Prose alone does NOT hold
+// it: with several reference images attached, the model reshapes its output after them and
+// silently returns the wrong orientation. Must be one of the API's accepted enum values.
 export async function geminiGenerate(opts: {
   prompt: string
   images: string[]
   model: string
+  aspectRatio?: string
 }): Promise<string> {
   const keys = loadKeys()
   if (!keys.length) throw new Error('No Gemini API key set. Add one in Settings (or a .env with GEMINI_API_KEY).')
 
   const parts: unknown[] = [{ text: opts.prompt }, ...opts.images.map((d) => ({ inline_data: dataUrlToInline(d) }))]
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${opts.model}:generateContent`
-  const body = JSON.stringify({ contents: [{ parts }], generationConfig: { responseModalities: ['IMAGE'] } })
+  const body = JSON.stringify({
+    contents: [{ parts }],
+    generationConfig: {
+      responseModalities: ['IMAGE'],
+      ...(opts.aspectRatio ? { imageConfig: { aspectRatio: opts.aspectRatio } } : {})
+    }
+  })
 
   let lastErr = ''
   for (let i = 0; i < keys.length; i++) {

@@ -1,4 +1,5 @@
 import { clamp } from './util'
+import { matteAlpha } from './matte'
 
 // All image processing happens here in the renderer via the 2D canvas — so the
 // desktop app needs no native modules (sharp) at all. Gemini itself is called in
@@ -22,57 +23,24 @@ function makeCanvas(w: number, h: number): { cv: HTMLCanvasElement; ctx: CanvasR
   const ctx = cv.getContext('2d')!
   return { cv, ctx }
 }
-async function gemini(prompt: string, model: string, images: string[]): Promise<string> {
-  const r = await window.api.gemini({ prompt, model, images })
+async function gemini(prompt: string, model: string, images: string[], aspectRatio?: string): Promise<string> {
+  const r = await window.api.gemini({ prompt, model, images, aspectRatio })
   if (r.error || !r.image) throw new Error(r.error || 'no image returned')
   return r.image
 }
 
-// Whole-image RESTYLE: redraw the base subject in the STYLE of the reference(s), keeping
-// the base's subject/framing. Borrow look only (palette/materials/letterforms), never the
-// reference's layout/text. Output at the base's aspect ratio.
-function restylePrompt(userPrompt: string, refCount: number, W: number, H: number): string {
-  const lines = [
-    'You are restyling one small piece of game-UI art.',
-    'IMAGE 1 is the BASE. Keep its subject, silhouette, composition and framing (for example a single icon or object, centered as it is in IMAGE 1).'
-  ]
-  if (refCount > 0) {
-    lines.push(
-      `The other ${refCount} image(s) are STYLE REFERENCES. Copy ONLY their look: color palette, metal/gold materials, lighting, glow, rendering style and letterforms, and apply that look to the subject of IMAGE 1.`
-    )
-  }
-  lines.push(
-    userPrompt.trim() ? `Instruction: "${userPrompt.trim()}".` : 'Re-render the subject of IMAGE 1 in the reference style.',
-    'Do NOT copy the reference layout, its words, numbers or extra objects. Borrow the STYLE only. Show ONLY the IMAGE 1 subject, centered, on a clean transparent background.',
-    `Output ONE image at the SAME width-to-height aspect ratio as IMAGE 1 (about ${W} by ${H}). No borders, frames, padding or letterboxing.`
-  )
-  return lines.join('\n')
-}
-
-// Annotated-crop edit (small selections): no mask images — Nano Banana follows a drawn
-// MARKER + semantic instruction far more reliably than a separate black/white mask
-// (masks made it paste refs / draw mask-edge scribbles). The magenta rectangle exists
-// only in the input; the model is told to remove it, and we composite only the region
-// interior back anyway. Validated live 2026-07-02 (key recolor test, gens 3+4).
-function markedEditPrompt(userPrompt: string, refCount: number): string {
-  const lines = [
-    'You are editing one small piece of game-UI art.',
-    'The LAST image is the ARTWORK to edit. A MAGENTA RECTANGLE has been drawn on it as a marker: it surrounds the ONE element you must edit. The rectangle is only an annotation — NEVER draw it, or any magenta, in your output.'
-  ]
-  if (refCount > 0) {
-    lines.push(
-      `The image(s) before it are COLOR / STYLE REFERENCES, shown letterboxed on a dark background (ignore the dark padding). Take from them ONLY the look the instruction asks for (palette, gold/metal finish, lighting). Do NOT copy their text, numbers, layout or objects into the artwork.`
-    )
-  }
-  lines.push(
-    userPrompt.trim()
-      ? `Instruction for the marked element: "${userPrompt.trim()}".`
-      : 'Restyle the marked element to match the reference look.',
-    'Modify ONLY the marked element. Keep its exact shape, silhouette, position, size and identity unless the instruction says otherwise — a recolor changes colors/materials, never the drawing itself. Never erase it and never replace it with background.',
-    'Everything OUTSIDE the marked element must stay EXACTLY identical to the artwork: same stone, text, letters, numbers, lighting and framing, pixel for pixel.',
-    'Output ONE image at the SAME dimensions, aspect ratio and framing as the ARTWORK (the last image), with the magenta marker removed.'
-  )
-  return lines.join('\n')
+// The only output shapes the image API accepts. Anything else is rejected, so we snap.
+const ASPECTS: [string, number][] = [
+  ['1:1', 1], ['2:3', 2 / 3], ['3:2', 3 / 2], ['3:4', 3 / 4], ['4:3', 4 / 3],
+  ['4:5', 4 / 5], ['5:4', 5 / 4], ['9:16', 9 / 16], ['16:9', 16 / 9], ['21:9', 21 / 9]
+]
+// Nearest allowed aspect to the real artwork, compared in log space so 21:9 doesn't swallow
+// everything wide (a 2x ratio error reads the same whether it lands above or below).
+export function nearestAspect(w: number, h: number): string {
+  const target = Math.log(w / h)
+  let best = ASPECTS[0]
+  for (const a of ASPECTS) if (Math.abs(Math.log(a[1]) - target) < Math.abs(Math.log(best[1]) - target)) best = a
+  return best[0]
 }
 
 // Letterbox an image onto a canvas with the TARGET aspect ratio (dark neutral padding).
@@ -93,76 +61,77 @@ async function padToAspect(src: string, targetW: number, targetH: number): Promi
   return cv.toDataURL('image/png')
 }
 
-// Full-frame inpaint: the model sees the WHOLE artwork (IMAGE 1) for context, a MASK
-// (IMAGE 2) marking exactly where to edit, and optional references, then returns the
-// whole frame. We composite only the masked region back, so the rest stays identical.
-function inpaintPrompt(
-  userPrompt: string,
-  refCount: number,
-  r: { selX: number; selY: number; selW: number; selH: number; W: number; H: number }
-): string {
-  const pctX = Math.round((r.selX / r.W) * 100)
-  const pctY = Math.round((r.selY / r.H) * 100)
-  const pctW = Math.round((r.selW / r.W) * 100)
-  const pctH = Math.round((r.selH / r.H) * 100)
-  const lines = [
-    'You are doing a precise, LOCAL inpaint (generative fill) on a piece of game-UI artwork.',
-    'IMAGE 1 is the FULL original artwork. It is your base and your context for the exact art style, lighting, palette and layout.',
-    'IMAGE 2 is a MASK aligned pixel-for-pixel to IMAGE 1: pure black everywhere except one WHITE region. That white region is the ONLY area you may change. IMAGE 2 is guidance only: never draw, trace, tint or output the mask, its edges or its colors.',
-    'IMAGE 3 is a CLOSE-UP CROP of exactly what the white region contains right now. That existing content is your BASE for the edit.'
-  ]
-  if (refCount > 0) {
-    lines.push(
-      `The final ${refCount} image(s) are REFERENCES for style, color and material. Borrow their look (palette, gold/metal finish, lighting, letterform style) as the instruction directs. Do NOT paste their text, numbers, layout or objects into the region unless the instruction explicitly asks for that.`
-    )
-  }
-  lines.push(
-    userPrompt.trim()
-      ? `Instruction for the white region: "${userPrompt.trim()}".`
-      : refCount > 0
-        ? 'Restyle the existing content of the white region to match the reference look.'
-        : 'Fill the white region consistently with the surrounding artwork.',
-    'Unless the instruction explicitly says to remove or replace the element, MODIFY the existing content shown in IMAGE 3: keep its shape, silhouette, position and identity, changing only what the instruction asks (for example its colors or materials). NEVER erase it, and NEVER fill the region with plain background, stone or empty wall unless the instruction asks for removal.',
-    `The white region is about ${pctW}% wide and ${pctH}% tall, positioned around ${pctX}% from the left and ${pctY}% from the top. Keep the edited content at that size and position.`,
-    'Return the ENTIRE image at the SAME dimensions as IMAGE 1. Every pixel OUTSIDE the white region must stay identical to IMAGE 1 (same shapes, letters, numbers, symbols, colors and lighting). Do not restyle, shift, recolor or garble anything outside the region.',
-    'INSIDE the white region, integrate the edit so it matches the artwork style, lighting, palette, perspective, materials and edges. It must be seamless, with no visible box, border, frame, outline, seam or leftover mask tint.',
-    'Output ONLY the final image.'
-  )
-  return lines.join('\n')
-}
-
-// Paint the selection shape (rounded rect, or the brush stroke) in FULL-image coords.
-function paintRegion(
-  ctx: CanvasRenderingContext2D,
+// Nano Banana regenerates the whole card with a slight GLOBAL tone shift, so even the parts it
+// was told to "keep the same" come back on a drifted palette — the card looks off vs the
+// original. Re-map the model's output onto the original's tone using ONLY the pixels OUTSIDE
+// the marked element (plus a seam margin): a per-channel gain + offset fit (match mean and
+// spread). Because the fit is derived from the parts that shouldn't change, it corrects the
+// global drift without ever fighting the intended change to the marked element.
+function alignTone(
+  gen: { cv: HTMLCanvasElement; ctx: CanvasRenderingContext2D },
+  orig: { cv: HTMLCanvasElement; ctx: CanvasRenderingContext2D },
   region: { selX: number; selY: number; selW: number; selH: number },
-  stroke?: { points: Pt[]; radius: number }
+  margin: number,
+  W: number,
+  H: number
 ): void {
-  if (stroke && stroke.points.length >= 1) {
-    const r = Math.max(1, Math.round(stroke.radius))
-    if (stroke.points.length === 1) {
-      const pt = stroke.points[0]
-      ctx.beginPath()
-      ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2)
-      ctx.fill()
-    } else {
-      ctx.lineWidth = 2 * r
-      ctx.lineCap = 'round'
-      ctx.lineJoin = 'round'
-      ctx.beginPath()
-      stroke.points.forEach((pt, i) => (i ? ctx.lineTo(pt.x, pt.y) : ctx.moveTo(pt.x, pt.y)))
-      ctx.stroke()
+  const gImg = gen.ctx.getImageData(0, 0, W, H)
+  const gd = gImg.data
+  const od = orig.ctx.getImageData(0, 0, W, H).data
+  const x0 = region.selX - margin
+  const x1 = region.selX + region.selW + margin
+  const y0 = region.selY - margin
+  const y1 = region.selY + region.selH + margin
+  const step = Math.max(1, Math.round(Math.sqrt((W * H) / 40000))) // cap at ~40k samples
+  const sg = [0, 0, 0]
+  const so = [0, 0, 0]
+  const sg2 = [0, 0, 0]
+  const so2 = [0, 0, 0]
+  let n = 0
+  for (let y = 0; y < H; y += step) {
+    for (let x = 0; x < W; x += step) {
+      if (x >= x0 && x <= x1 && y >= y0 && y <= y1) continue // skip region + seam band
+      const i = (y * W + x) * 4
+      if (od[i + 3] < 250 || gd[i + 3] < 250) continue // only compare solid pixels
+      for (let c = 0; c < 3; c++) {
+        sg[c] += gd[i + c]
+        so[c] += od[i + c]
+        sg2[c] += gd[i + c] * gd[i + c]
+        so2[c] += od[i + c] * od[i + c]
+      }
+      n++
     }
-  } else {
-    const rr = clamp(Math.round(Math.min(region.selW, region.selH) * 0.08), 0, 24)
-    ctx.beginPath()
-    ctx.roundRect(region.selX, region.selY, region.selW, region.selH, rr)
-    ctx.fill()
   }
+  if (n < 200) return // too few unchanged samples to trust a fit
+  const a = [1, 1, 1]
+  const b = [0, 0, 0]
+  let drift = 0
+  for (let c = 0; c < 3; c++) {
+    const mg = sg[c] / n
+    const mo = so[c] / n
+    const varG = sg2[c] / n - mg * mg
+    const varO = so2[c] / n - mo * mo
+    // Alignment-free histogram match: scale the model's spread to the original's (std ratio),
+    // then re-centre the mean. Unlike a least-squares fit this needs NO pixel correspondence,
+    // so a whole-card regeneration (whose pixels don't line up with the original) can't collapse
+    // the gain and wash the card out. On near-flat surroundings std is ill-conditioned → offset.
+    a[c] = varG > 9 ? clamp(Math.sqrt(varO / varG), 0.6, 1.6) : 1
+    b[c] = mo - a[c] * mg
+    drift += Math.abs(a[c] - 1) + Math.abs(b[c]) / 255
+  }
+  if (drift < 0.03) return // the model already matched — leave it untouched
+  for (let i = 0; i < gd.length; i += 4) {
+    gd[i] = clamp(a[0] * gd[i] + b[0], 0, 255)
+    gd[i + 1] = clamp(a[1] * gd[i + 1] + b[1], 0, 255)
+    gd[i + 2] = clamp(a[2] * gd[i + 2] + b[2], 0, 255)
+  }
+  gen.ctx.putImageData(gImg, 0, 0)
 }
 function removeBgPrompt(): string {
   return [
     'You are a precise background-removal tool.',
     'Keep the MAIN foreground subject of this image EXACTLY as it is: identical shape, silhouette, edges, proportions, position, scale, colors, materials, lighting, and any text, numbers or symbols on it. Do not redraw, restyle, move, add to or crop the subject.',
+    'Keep the subject at the EXACT same pixel position and scale, with the EXACT same empty margins/padding around it (left, right, top and bottom). Do NOT zoom in, recenter, rotate, rescale or fill the margins — only the background colour changes.',
     'Replace ONLY the background (everything that is not the main subject) with a SOLID, FLAT, PERFECTLY UNIFORM pure MAGENTA (#FF00FF / rgb(255,0,255)). No gradient, no shadow, no vignette, no border, no leftover background detail. The magenta must be uniform so it can be keyed out to transparency.',
     'Output at the SAME pixel dimensions and framing as the input.'
   ].join('\n')
@@ -190,6 +159,52 @@ function keyOutMagenta(ctx: CanvasRenderingContext2D, w: number, h: number): voi
   }
   ctx.putImageData(id, 0, 0)
 }
+
+// Bleed the nearest fully-opaque colour outward into the semi-transparent EDGE band (up to a few
+// px), keeping each pixel's alpha. Kills the colour-contaminated fringe left when a subject is cut
+// off a coloured background — a magenta halo, or a light/white matte ring — without touching the
+// solid interior (so a blue gem, etc. stays its own colour).
+function decontaminateEdges(ctx: CanvasRenderingContext2D, w: number, h: number, depth = 4): void {
+  const id = ctx.getImageData(0, 0, w, h)
+  const d = id.data
+  const dist = new Int16Array(w * h).fill(-1)
+  const qx: number[] = []
+  const qy: number[] = []
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (d[(y * w + x) * 4 + 3] >= 250) {
+        dist[y * w + x] = 0
+        qx.push(x)
+        qy.push(y)
+      }
+    }
+  }
+  for (let head = 0; head < qx.length; head++) {
+    const x = qx[head]
+    const y = qy[head]
+    const dd = dist[y * w + x]
+    if (dd >= depth) continue
+    const si = (y * w + x) * 4
+    const nb = [
+      [x - 1, y],
+      [x + 1, y],
+      [x, y - 1],
+      [x, y + 1]
+    ]
+    for (const [nx, ny] of nb) {
+      if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue
+      const nj = ny * w + nx
+      if (dist[nj] !== -1 || d[nj * 4 + 3] >= 250) continue
+      dist[nj] = dd + 1
+      d[nj * 4] = d[si]
+      d[nj * 4 + 1] = d[si + 1]
+      d[nj * 4 + 2] = d[si + 2]
+      qx.push(nx)
+      qy.push(ny)
+    }
+  }
+  ctx.putImageData(id, 0, 0)
+}
 function bgExtractPrompt(userPrompt?: string): string {
   const what = userPrompt?.trim() ? ` The background to keep is: "${userPrompt.trim()}".` : ''
   return [
@@ -213,10 +228,45 @@ function extractPrompt(userPrompt?: string): string {
   ].join('\n')
 }
 
-// Generate: regenerate a selected region IN PLACE. The model receives the FULL frame
-// (for context so it places/scales/lights the new content correctly), a MASK marking
-// the region, and optional references; we then composite only the masked region back
-// onto the pristine original so nothing outside the selection can drift.
+// Prompt for a whole-card edit: the model regenerates the ENTIRE card in one pass and
+// changes ONLY the magenta-marked element, returning a complete, fully OPAQUE card.
+function wholeCardEditPrompt(
+  userPrompt: string,
+  refCount: number,
+  r: { selX: number; selY: number; selW: number; selH: number; W: number; H: number }
+): string {
+  const pctX = Math.round((r.selX / r.W) * 100)
+  const pctY = Math.round((r.selY / r.H) * 100)
+  const pctW = Math.round((r.selW / r.W) * 100)
+  const pctH = Math.round((r.selH / r.H) * 100)
+  const lines = [
+    'You are editing one piece of game-UI CARD artwork. The LAST image is the FULL card to edit.',
+    'A MAGENTA RECTANGLE has been drawn on it to mark the ONE element you must change. The rectangle is only an annotation — NEVER draw it, or any magenta, in your output.'
+  ]
+  if (refCount > 0) {
+    lines.push(
+      'The image(s) before it are STYLE REFERENCES, letterboxed on dark padding (ignore the padding). Borrow ONLY the look the instruction asks for (palette, metal/gold finish, lighting, letterforms). Never copy their text, numbers, layout or objects.'
+    )
+  }
+  lines.push(
+    userPrompt.trim()
+      ? `Change ONLY the marked element, exactly as follows: "${userPrompt.trim()}".`
+      : refCount > 0
+        ? 'Restyle ONLY the marked element to match the reference look.'
+        : 'Cleanly redraw ONLY the marked element so it fits the card.',
+    `The marked element is about ${pctW}% wide and ${pctH}% tall, positioned around ${pctX}% from the left and ${pctY}% from the top.`,
+    'Regenerate and return the ENTIRE card as ONE coherent image at the SAME dimensions, aspect ratio and framing as the input. Keep everything OUTSIDE the marked element visually the same — same layout, silhouette, art style, metal, gem, banner, colours and lighting — so ONLY the marked element changes.',
+    'The output MUST be FULLY OPAQUE: paint every pixel. No transparency, no alpha, no see-through or empty areas — render any inner window or panel as solid painted artwork.',
+    'Match the art style, lighting, colour temperature, palette and materials across the whole card so the edit is seamless: no visible boundary, box, outline, seam, halo, glow or blur.',
+    'Output ONLY the final full card image.'
+  )
+  return lines.join('\n')
+}
+
+// Generate: the AI regenerates the ENTIRE card in one pass, applying the change ONLY to the
+// marked element. We use the model's whole coherent output directly — no masking, feather,
+// transparency or compositing — so every result is a complete, fully opaque card with no seam
+// or patch. A tone lock keeps the palette from drifting on reference-free element edits.
 export async function imageEdit(p: {
   src: string
   bbox: Box
@@ -233,129 +283,75 @@ export async function imageEdit(p: {
   const selY = clamp(Math.round(p.bbox.y), 0, H - 1)
   const selW = clamp(Math.round(p.bbox.w), 1, W - selX)
   const selH = clamp(Math.round(p.bbox.h), 1, H - selY)
+  const region = { selX, selY, selW, selH }
   const refs = (p.references || []).slice(0, 4)
 
-  // WHOLE-image restyle: the selection covers (essentially) the whole node → don't do
-  // masked inpaint. Redraw the subject guided by refs + prompt, and FIT the result into the
-  // core dimensions PRESERVING ASPECT (no stretch/squish), keeping the core resolution.
-  // Coverage-based so a near-full box (not just a pixel-exact double-click) still restyles.
-  // Gated to reference-driven restyles or transparent icons, so a whole-frame prompt-only
-  // edit on an opaque frame still goes through inpaint (and keeps its own background).
-  const isWhole = !p.stroke && selW * selH >= 0.82 * W * H && (refs.length > 0 || !!p.transparent)
-  if (isWhole) {
-    const paddedRefs = await Promise.all(refs.map((r) => padToAspect(r, W, H)))
-    const genUrl = await gemini(restylePrompt(p.prompt, refs.length, W, H), p.model, [p.src, ...paddedRefs])
-    const gen = await loadImg(genUrl)
-    const gw = gen.naturalWidth || W
-    const gh = gen.naturalHeight || H
-    const s = Math.min(W / gw, H / gh) // contain: preserve aspect, never distort
-    const dw = Math.round(gw * s)
-    const dh = Math.round(gh * s)
-    const out = makeCanvas(W, H)
-    out.ctx.drawImage(gen, Math.round((W - dw) / 2), Math.round((H - dh) / 2), dw, dh)
-    return out.cv.toDataURL('image/png')
-  }
+  // The full card with a magenta marker box drawn around the element to change.
+  const ann = makeCanvas(W, H)
+  ann.ctx.drawImage(img, 0, 0)
+  ann.ctx.strokeStyle = '#FF00FF'
+  ann.ctx.lineWidth = Math.max(3, Math.round(Math.min(W, H) * 0.006))
+  ann.ctx.strokeRect(selX, selY, selW, selH)
 
-  // SMALL selections: edit a CROP around the region so the element is LARGE (a key at
-  // ~2% of a big frame is invisible at full-frame scale — the model paints a blob).
-  // The region is pointed at with a drawn MAGENTA MARKER + semantic instruction (no
-  // mask images — Nano Banana follows annotations far better). We paste only the
-  // feathered region interior back onto the pristine original.
-  const small = selW * selH <= 0.2 * W * H
-  const feather = clamp(Math.round(Math.min(selW, selH) * 0.06), 4, 48)
-
-  if (small) {
-    const off = feather + 6 // marker sits outside the composited area (past the feather spread)
-    const margin = Math.max(Math.round(Math.max(selW, selH) * 0.6), 64, off + 12)
-    const cropX = clamp(selX - margin, 0, W)
-    const cropY = clamp(selY - margin, 0, H)
-    const cw = clamp(selX + selW + margin, 1, W) - cropX
-    const ch = clamp(selY + selH + margin, 1, H) - cropY
-    const er = { selX: selX - cropX, selY: selY - cropY, selW, selH }
-    const estroke = p.stroke
-      ? { points: p.stroke.points.map((pt) => ({ x: pt.x - cropX, y: pt.y - cropY })), radius: p.stroke.radius }
-      : undefined
-
-    // The ARTWORK: the crop with the magenta marker rectangle drawn around the selection
-    const ann = makeCanvas(cw, ch)
-    ann.ctx.drawImage(img, cropX, cropY, cw, ch, 0, 0, cw, ch)
-    ann.ctx.strokeStyle = '#FF00FF'
-    ann.ctx.lineWidth = Math.max(3, Math.round(Math.min(cw, ch) * 0.01))
-    ann.ctx.strokeRect(er.selX - off, er.selY - off, selW + 2 * off, selH + 2 * off)
-
-    // refs are letterboxed to the crop's aspect (else they reshape the output), artwork LAST
-    const paddedRefs = await Promise.all(refs.map((r) => padToAspect(r, cw, ch)))
-    const genUrl = await gemini(markedEditPrompt(p.prompt, refs.length), p.model, [...paddedRefs, ann.cv.toDataURL('image/png')])
-    const gen = await loadImg(genUrl)
-
-    // Guard: if the model still returned a different shape, compositing would paste a
-    // squashed fragment — fail loudly instead so the user can just re-run.
-    const ga = gen.naturalWidth / gen.naturalHeight
-    if (Math.abs(ga / (cw / ch) - 1) > 0.08) {
-      throw new Error('The model returned a differently-shaped image. Run it again (or remove very wide/tall references).')
-    }
-
-    // Scale the result to the crop's dimensions, keep only the feathered region, paste back.
-    const genCv = makeCanvas(cw, ch)
-    genCv.ctx.drawImage(gen, 0, 0, cw, ch)
-    const softMask = makeCanvas(cw, ch)
-    softMask.ctx.filter = `blur(${feather}px)`
-    softMask.ctx.fillStyle = '#fff'
-    softMask.ctx.strokeStyle = '#fff'
-    paintRegion(softMask.ctx, er, estroke)
-    softMask.ctx.filter = 'none'
-    genCv.ctx.globalCompositeOperation = 'destination-in'
-    genCv.ctx.drawImage(softMask.cv, 0, 0)
-    genCv.ctx.globalCompositeOperation = 'source-over'
-
-    const out = makeCanvas(W, H)
-    out.ctx.drawImage(img, 0, 0)
-    out.ctx.drawImage(genCv.cv, cropX, cropY)
-    return out.cv.toDataURL('image/png')
-  }
-
-  // LARGE selections: full-frame mask inpaint (the region is big enough to see).
-  const region = { selX, selY, selW, selH }
-  const hardMask = makeCanvas(W, H)
-  hardMask.ctx.fillStyle = '#000'
-  hardMask.ctx.fillRect(0, 0, W, H)
-  hardMask.ctx.fillStyle = '#fff'
-  hardMask.ctx.strokeStyle = '#fff'
-  paintRegion(hardMask.ctx, region, p.stroke)
-  const maskUrl = hardMask.cv.toDataURL('image/png')
-
-  // IMAGE 3: a close-up of the region's CURRENT content, so the model edits what's
-  // there instead of erasing it and inpainting background. Padded to the frame's
-  // aspect (like the refs) so an odd-shaped region can't reshape the output.
-  const closeup = makeCanvas(selW, selH)
-  closeup.ctx.drawImage(img, selX, selY, selW, selH, 0, 0, selW, selH)
-  const closeupUrl = await padToAspect(closeup.cv.toDataURL('image/png'), W, H)
+  // Style refs are letterboxed to the card's aspect (else they reshape the output); card LAST.
   const paddedRefs = await Promise.all(refs.map((r) => padToAspect(r, W, H)))
-
-  const prompt = inpaintPrompt(p.prompt, refs.length, { ...region, W, H })
-  const genUrl = await gemini(prompt, p.model, [p.src, maskUrl, closeupUrl, ...paddedRefs])
+  const genUrl = await gemini(
+    wholeCardEditPrompt(p.prompt, refs.length, { ...region, W, H }),
+    p.model,
+    [...paddedRefs, ann.cv.toDataURL('image/png')]
+  )
   const gen = await loadImg(genUrl)
 
-  // Scale the result to the original's exact dimensions (in case the model reframed).
-  const genCv = makeCanvas(W, H)
-  genCv.ctx.drawImage(gen, 0, 0, W, H)
-
-  // Feathered white mask of the selection → keep only the region from the result.
-  const softMask = makeCanvas(W, H)
-  softMask.ctx.filter = `blur(${feather}px)`
-  softMask.ctx.fillStyle = '#fff'
-  softMask.ctx.strokeStyle = '#fff'
-  paintRegion(softMask.ctx, region, p.stroke)
-  softMask.ctx.filter = 'none'
-
-  genCv.ctx.globalCompositeOperation = 'destination-in'
-  genCv.ctx.drawImage(softMask.cv, 0, 0)
-  genCv.ctx.globalCompositeOperation = 'source-over'
-
-  // Composite the edited region over the untouched original.
+  // Use the model's whole coherent card, scaled to the exact original dimensions — opaque.
   const out = makeCanvas(W, H)
-  out.ctx.drawImage(img, 0, 0)
-  out.ctx.drawImage(genCv.cv, 0, 0)
+  out.ctx.drawImage(gen, 0, 0, W, H)
+
+  // Lock the palette to the original (via the unchanged surroundings) on reference-free edits,
+  // so a localized change can't drift the whole card's tone. Skip for ref-driven restyles.
+  if (refs.length === 0) {
+    const origFull = makeCanvas(W, H)
+    origFull.ctx.drawImage(img, 0, 0)
+    alignTone(out, origFull, region, Math.max(8, Math.round(Math.min(W, H) * 0.02)), W, H)
+  }
+
+  return out.cv.toDataURL('image/png')
+}
+
+// Whole-image RESTYLE (style guides): re-render the WHOLE artwork in the style of the bundled
+// reference art, keeping its layout, text and composition. No magenta marker and no "keep
+// everything outside the same" — for a whole-image restyle there IS no outside, and the marker
+// would sit on the outermost pixels. `prompt` arrives fully built (see styleguides/index.ts) so
+// the preview panel can show the user the exact text we send.
+//
+// Image order is load-bearing: the BASE goes FIRST and the prompt names "the FIRST attached
+// image" as the restyle target. (imageEdit does the opposite — refs first, card last — and says
+// so in its own prompt. Each is self-consistent; don't cross the wires.)
+export async function imageRestyle(p: {
+  src: string
+  prompt: string
+  model: string
+  references: string[]
+}): Promise<string> {
+  const img = await loadImg(p.src)
+  const W = img.naturalWidth
+  const H = img.naturalHeight
+  const refs = p.references.slice(0, 3) // base + 3 refs = the 4-image cap
+
+  // Letterbox refs to the artwork's aspect — an unpadded ref reshapes the output (see padToAspect).
+  const paddedRefs = await Promise.all(refs.map((r) => padToAspect(r, W, H)))
+  const genUrl = await gemini(p.prompt, p.model, [p.src, ...paddedRefs], nearestAspect(W, H))
+  const gen = await loadImg(genUrl)
+
+  // Contain-fit into the original resolution: preserve aspect, never stretch. The aspect lock
+  // makes a mismatch unlikely, but a snapped enum is never an EXACT match for arbitrary pixel
+  // dimensions, so the letterbox is what keeps the result from being squashed.
+  const gw = gen.naturalWidth || W
+  const gh = gen.naturalHeight || H
+  const s = Math.min(W / gw, H / gh)
+  const dw = Math.round(gw * s)
+  const dh = Math.round(gh * s)
+  const out = makeCanvas(W, H)
+  out.ctx.drawImage(gen, Math.round((W - dw) / 2), Math.round((H - dh) / 2), dw, dh)
   return out.cv.toDataURL('image/png')
 }
 
@@ -401,16 +397,180 @@ export async function imageExtractBackground(p: { src: string; bbox: Box; prompt
   return cv.cv.toDataURL('image/png')
 }
 
-// Remove background: keep the whole subject as-is, cut everything behind it to
-// transparency (Gemini paints the background magenta, we key it out). Same dimensions.
-export async function imageRemoveBg(p: { src: string; model: string }): Promise<string> {
+// Band-limited edge defringe for a known background colour: within a few px of the transparent
+// cut, re-estimate each pixel's coverage from how background-like it is and un-premultiply the
+// background out of it. This neutralises the light/white matte halo that rings a subject cut off a
+// coloured background — colour-corrected, so it stays clean over ANY new background — WITHOUT
+// touching anything more than R px inside the edge (so a light interior panel, e.g. a tan text box,
+// which sits far from the cut, is never dimmed or eaten).
+function defringe(ctx: CanvasRenderingContext2D, W: number, H: number, bg: number[], R = 3, HImatte = 400): void {
+  const id = ctx.getImageData(0, 0, W, H)
+  const d = id.data
+  const N = W * H
+  const LO = 32
+  const dist = new Int16Array(N).fill(-1)
+  const q: number[] = []
+  for (let i = 0; i < N; i++) {
+    if (d[i * 4 + 3] < 20) {
+      dist[i] = 0
+      q.push(i)
+    }
+  }
+  for (let head = 0; head < q.length; head++) {
+    const i = q[head]
+    if (dist[i] >= R) continue
+    const x = i % W
+    const nb = [x > 0 ? i - 1 : -1, x < W - 1 ? i + 1 : -1, i >= W ? i - W : -1, i < N - W ? i + W : -1]
+    for (const j of nb) {
+      if (j >= 0 && dist[j] === -1) {
+        dist[j] = dist[i] + 1
+        q.push(j)
+      }
+    }
+  }
+  for (let i = 0; i < N; i++) {
+    if (dist[i] < 1 || d[i * 4 + 3] < 20) continue
+    const cd = Math.abs(d[i * 4] - bg[0]) + Math.abs(d[i * 4 + 1] - bg[1]) + Math.abs(d[i * 4 + 2] - bg[2])
+    const aeff = cd <= LO ? 0 : cd >= HImatte ? 1 : (cd - LO) / (HImatte - LO)
+    if (aeff >= 1) continue
+    const a = Math.round(aeff * 255)
+    for (let c = 0; c < 3; c++) {
+      d[i * 4 + c] = clamp(Math.round(bg[c] + ((d[i * 4 + c] - bg[c]) * 255) / Math.max(a, 1)), 0, 255)
+    }
+    d[i * 4 + 3] = Math.min(d[i * 4 + 3], a)
+  }
+  ctx.putImageData(id, 0, 0)
+}
+
+// Deterministic removal of a (near-)uniform background: flood-fill the background colour from the
+// corners (the outer margin) AND any enclosed same-colour region above a size threshold (e.g. an
+// empty art window inside a frame), with an anti-aliased alpha ramp at the boundary. The fill is
+// CONNECTED, so the non-background subject (frame, gem, tan panel) blocks it and is never eaten —
+// every detail and the exact resolution/padding survive.
+function keyOutUniformBg(ctx: CanvasRenderingContext2D, W: number, H: number, bg: number[]): void {
+  const id = ctx.getImageData(0, 0, W, H)
+  const d = id.data
+  const N = W * H
+  const LO = 32
+  const HI = 200
+  const dd = new Int32Array(N)
+  for (let i = 0; i < N; i++) {
+    dd[i] = Math.abs(d[i * 4] - bg[0]) + Math.abs(d[i * 4 + 1] - bg[1]) + Math.abs(d[i * 4 + 2] - bg[2])
+  }
+  const state = new Uint8Array(N) // 0 unvisited · 1 remove · 2 kept small component
+  const stack: number[] = []
+  const seed = (i: number): void => {
+    if (state[i] === 0 && dd[i] < HI) {
+      state[i] = 1
+      stack.push(i)
+    }
+  }
+  seed(0)
+  seed(W - 1)
+  seed((H - 1) * W)
+  seed(N - 1)
+  while (stack.length) {
+    const i = stack.pop() as number
+    const x = i % W
+    if (x > 0) seed(i - 1)
+    if (x < W - 1) seed(i + 1)
+    if (i >= W) seed(i - W)
+    if (i < N - W) seed(i + W)
+  }
+  // Enclosed same-colour regions (an empty window/hole surrounded by the subject).
+  const MIN = Math.max(64, Math.round(N * 0.002))
+  for (let s = 0; s < N; s++) {
+    if (state[s] !== 0 || dd[s] >= HI) continue
+    const comp: number[] = [s]
+    state[s] = 2
+    for (let qi = 0; qi < comp.length; qi++) {
+      const i = comp[qi]
+      const x = i % W
+      const nb = [x > 0 ? i - 1 : -1, x < W - 1 ? i + 1 : -1, i >= W ? i - W : -1, i < N - W ? i + W : -1]
+      for (const j of nb) {
+        if (j >= 0 && state[j] === 0 && dd[j] < HI) {
+          state[j] = 2
+          comp.push(j)
+        }
+      }
+    }
+    if (comp.length >= MIN) for (const i of comp) state[i] = 1
+  }
+  for (let i = 0; i < N; i++) {
+    if (state[i] === 1) {
+      const t = dd[i]
+      const a = t <= LO ? 0 : t >= HI ? 255 : Math.round(((t - LO) / (HI - LO)) * 255)
+      d[i * 4 + 3] = Math.min(d[i * 4 + 3], a)
+    }
+  }
+  ctx.putImageData(id, 0, 0)
+}
+
+// Remove background: keep the whole subject exactly (pixels, position, resolution, padding) and cut
+// everything behind it — AND any enclosed empty window — to transparency. Two engines:
+//   'mechanical' — deterministic flood-fill of the (uniform) background colour: no model, so it is
+//                  instant and can't reframe, clip the frame or leave a colour halo. Best for a
+//                  subject on a solid/flat background.
+//   'ai'         — the model paints the background magenta; we key that to an alpha mask and apply
+//                  it to the pristine original. Handles photographic / complex backgrounds.
+// 'auto' picks mechanical when the four corners agree (a solid background), else the AI engine.
+export async function imageRemoveBg(p: {
+  src: string
+  model: string
+  mode?: 'auto' | 'mechanical' | 'ai' | 'matte'
+}): Promise<string> {
   const img = await loadImg(p.src)
   const W = img.naturalWidth
   const H = img.naturalHeight
-  const genUrl = await gemini(removeBgPrompt(), p.model, [p.src])
-  const gen = await loadImg(genUrl)
-  const cv = makeCanvas(W, H)
-  cv.ctx.drawImage(gen, 0, 0, W, H)
-  keyOutMagenta(cv.ctx, W, H)
-  return cv.cv.toDataURL('image/png')
+  const out = makeCanvas(W, H)
+  out.ctx.drawImage(img, 0, 0)
+
+  // PRECISE: a real matting network predicts a soft foreground alpha; apply it straight to the
+  // original (no colour key, no defringe needed — the matte is already soft-edged).
+  if (p.mode === 'matte') {
+    const alpha = await matteAlpha(img, W, H)
+    const id = out.ctx.getImageData(0, 0, W, H)
+    for (let i = 0; i < W * H; i++) id.data[i * 4 + 3] = Math.round(alpha[i] * 255)
+    out.ctx.putImageData(id, 0, 0)
+    return out.cv.toDataURL('image/png')
+  }
+
+  // Sample the four corners → background colour + how uniform it is.
+  const c0 = out.ctx.getImageData(0, 0, W, H).data
+  const corners = [
+    [0, 0],
+    [W - 1, 0],
+    [0, H - 1],
+    [W - 1, H - 1]
+  ].map(([x, y]) => {
+    const i = (y * W + x) * 4
+    return [c0[i], c0[i + 1], c0[i + 2]]
+  })
+  const bg = [0, 1, 2].map((c) => Math.round(corners.reduce((s, pp) => s + pp[c], 0) / 4))
+  const spread = Math.max(...corners.map((pp) => Math.abs(pp[0] - bg[0]) + Math.abs(pp[1] - bg[1]) + Math.abs(pp[2] - bg[2])))
+
+  const mode = p.mode ?? 'auto'
+  const mechanical = mode === 'mechanical' || (mode === 'auto' && spread < 48)
+
+  if (mechanical) {
+    keyOutUniformBg(out.ctx, W, H, bg)
+  } else {
+    const genUrl = await gemini(removeBgPrompt(), p.model, [p.src])
+    const gen = await loadImg(genUrl)
+    const mask = makeCanvas(W, H)
+    mask.ctx.drawImage(gen, 0, 0, W, H)
+    keyOutMagenta(mask.ctx, W, H)
+    out.ctx.globalCompositeOperation = 'destination-in'
+    out.ctx.drawImage(mask.cv, 0, 0)
+    out.ctx.globalCompositeOperation = 'source-over'
+  }
+
+  // A solid-background matte leaves a light colour halo on the cut edge — whether it came from the
+  // mechanical fill or the AI mask. The band-limited defringe neutralises it (needs a known bg
+  // colour, so only when the corners are solid-ish; a genuinely photographic background is left to
+  // the decontamination pass below).
+  if (spread < 80) defringe(out.ctx, W, H, bg)
+
+  decontaminateEdges(out.ctx, W, H)
+  return out.cv.toDataURL('image/png')
 }

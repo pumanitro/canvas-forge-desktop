@@ -2,10 +2,21 @@
 
 import type { Project } from './types'
 
+declare module '*.onnx?url' {
+  const src: string
+  export default src
+}
+
+// Bundled style-guide reference art, inlined as a base64 data URL at build time.
+declare module '*.png?inline' {
+  const src: string
+  export default src
+}
+
 declare global {
   interface Window {
     api: {
-      gemini: (opts: { prompt: string; images: string[]; model: string }) => Promise<{ image?: string; error?: string }>
+      gemini: (opts: { prompt: string; images: string[]; model: string; aspectRatio?: string }) => Promise<{ image?: string; error?: string }>
       loadProjects: () => Promise<Project[]>
       saveProject: (p: Project) => Promise<unknown>
       deleteProject: (id: string) => Promise<unknown>

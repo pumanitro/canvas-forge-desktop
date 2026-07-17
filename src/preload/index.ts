@@ -2,7 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
 const api = {
-  gemini: (opts: { prompt: string; images: string[]; model: string }) =>
+  gemini: (opts: { prompt: string; images: string[]; model: string; aspectRatio?: string }) =>
     ipcRenderer.invoke('gemini:generate', opts) as Promise<{ image?: string; error?: string }>,
   loadProjects: () => ipcRenderer.invoke('projects:load'),
   saveProject: (p: unknown) => ipcRenderer.invoke('projects:save', p),

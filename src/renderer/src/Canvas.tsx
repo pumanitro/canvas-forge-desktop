@@ -3,7 +3,8 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { ImageNode, Project } from './types'
 import { clamp, uid } from './util'
 import { addPrompt, loadPrompts } from './store'
-import { imageEdit, imageExtract, imageExtractBackground, imageRemoveBg } from './imageOps'
+import { imageEdit, imageExtract, imageExtractBackground, imageRemoveBg, imageRestyle } from './imageOps'
+import { STYLE_GUIDES, buildRestylePrompt, refsFor } from './styleguides'
 
 type View = { x: number; y: number; zoom: number }
 type Tool = 'move' | 'rect' | 'draw' | 'magic'
@@ -143,6 +144,14 @@ export default function Canvas({
   const [count, setCount] = useState(1)
   const [extractMode, setExtractMode] = useState<ExtractMode>('isolate') // what the Extract button does
   const [showHistory, setShowHistory] = useState(false) // recent-prompt chips collapsed by default
+  // Built-in style guide: '' = none. Sticky across runs (unlike the prompt box and refs, which
+  // clearSelection wipes) so a batch of images can be restyled without re-picking every time.
+  const [guideId, setGuideId] = useState('')
+  const [guidePreview, setGuidePreview] = useState(false) // full description + exact prompt
+  // Which of the guide's materials to apply. Empty ⇒ all of them (the default: a fresh pick
+  // uses the whole direction). Deselecting one both drops the refs that show it and adds an
+  // explicit exclusion clause.
+  const [materials, setMaterials] = useState<string[]>([])
   // Figma-style Layers panel: hidden by default, toggled from the toolbar (or L)
   const [layersOpen, setLayersOpen] = useState(false)
   const [renamingLayer, setRenamingLayer] = useState<string | null>(null)
@@ -825,6 +834,7 @@ export default function Canvas({
       baseY: number
       colW: number
       count?: number // override the Runs setting (e.g. Remove BG is always a single run)
+      remember?: boolean // false ⇒ keep this prompt out of the recent-prompt history
     }) => {
       const N = clamp(params.count ?? count, 1, 10)
       const jobId = uid()
@@ -889,7 +899,7 @@ export default function Canvas({
         updatePending((prev) => prev.filter((s) => s.jobId !== jobId)) // sweep any stragglers
         if (ac.signal.aborted) return
         if (newIds.length > 0) {
-          if (params.prompt.trim()) addPrompt(params.prompt).then(setHistory)
+          if (params.prompt.trim() && params.remember !== false) addPrompt(params.prompt).then(setHistory)
         } else {
           const msg = errors[0] || 'failed'
           setCopyToast(msg.length > 90 ? msg.slice(0, 89) + '…' : msg)
@@ -934,6 +944,43 @@ export default function Canvas({
     setErr(null)
   }, [selection, promptText, model, references, nodeById, runGeneration, clearSelection])
 
+  // Restyle: re-render the selected image in a built-in style guide's art direction. One click —
+  // the guide supplies the prompt and its own reference art, so promptText may be empty (anything
+  // typed there rides along as an extra instruction on top).
+  //
+  // Restyle always works on the WHOLE node, not the marquee: a style guide re-renders the artwork
+  // edge-to-edge, and a part-restyled image would just seam. So we ignore any sub-region.
+  const runRestyle = useCallback(() => {
+    const sel = selection
+    const guide = STYLE_GUIDES.find((g) => g.id === guideId)
+    if (!sel || !guide) return
+    const node = nodeById(sel.imgId)
+    if (!node) return
+    const mats = materials.length ? materials : guide.materials.map((m) => m.id)
+    const prompt = buildRestylePrompt(guide, mats, promptText)
+    const src = node.src
+    const mdl = model
+    const refs = refsFor(guide, mats).map((r) => r.src)
+    const gap = Math.max(24, node.w * 0.05)
+    runGeneration({
+      perform: () => imageRestyle({ src, prompt, model: mdl, references: refs }),
+      prompt,
+      action: 'edit',
+      model: mdl,
+      // Restyle returns an OPAQUE image: drop any transparent flag the source carried, or the
+      // canvas would keep rendering it with the checkerboard treatment.
+      res: { w: node.w, h: node.h, nW: node.nW, nH: node.nH, transparent: false },
+      baseX: node.x + node.w + gap,
+      baseY: node.y,
+      colW: node.w + gap,
+      // The built prompt is ~1k of boilerplate — keep it out of the recent-prompt chips.
+      remember: false
+    })
+    clearSelection()
+    setPromptText('')
+    setErr(null)
+  }, [selection, guideId, materials, promptText, model, nodeById, runGeneration, clearSelection])
+
   // Extract a selection (a drawn region OR a whole frame). `mode` picks the algorithm:
   //   isolate    → cut the described element out, text removed, transparent background
   //   background → remove the foreground + text, keep only the (opaque) background scene
@@ -974,13 +1021,15 @@ export default function Canvas({
   }, [selection, promptText, extractMode, doExtract])
 
   // Remove background: cut everything behind the subject to transparency (whole image).
+  //   'mechanical' — deterministic flood-fill (instant, solid backgrounds)
+  //   'ai'         — the model handles photographic / complex backgrounds
   const doRemoveBg = useCallback(
-    (n: ImageNode) => {
+    (n: ImageNode, mode: 'mechanical' | 'ai' | 'matte' = 'mechanical') => {
       const src = n.src
       const mdl = model
       const gap = Math.max(24, n.w * 0.05)
       runGeneration({
-        perform: () => imageRemoveBg({ src, model: mdl }),
+        perform: () => imageRemoveBg({ src, model: mdl, mode }),
         prompt: '',
         action: 'extract',
         model: mdl,
@@ -988,7 +1037,7 @@ export default function Canvas({
         baseX: n.x + n.w + gap,
         baseY: n.y,
         colW: n.w + gap,
-        count: 1, // Remove BG is deterministic: always a single result, ignore the Runs setting
+        count: 1, // Remove BG is a single result, ignore the Runs setting
       })
     },
     [model, runGeneration]
@@ -1186,6 +1235,15 @@ export default function Canvas({
   }
 
   const fullFrame = (n: ImageNode): Sel => ({ imgId: n.id, x: n.x, y: n.y, w: n.w, h: n.h })
+  const activeGuide = STYLE_GUIDES.find((g) => g.id === guideId) || null
+  // Empty selection means "all" — so a guide is usable the moment it's picked.
+  const activeMaterials = activeGuide ? (materials.length ? materials : activeGuide.materials.map((m) => m.id)) : []
+  const toggleMaterial = (id: string): void =>
+    setMaterials((prev) => {
+      const cur = prev.length ? prev : (activeGuide?.materials.map((m) => m.id) ?? [])
+      const next = cur.includes(id) ? cur.filter((m) => m !== id) : [...cur, id]
+      return next.length ? next : cur // never let the last material be switched off
+    })
   const openMagicFor = (n: ImageNode): void => {
     const s = w2s(n.x + n.w / 2, n.y)
     setSelectedIds([n.id])
@@ -1386,7 +1444,11 @@ export default function Canvas({
           <div className="prompt-pop" style={{ left: popLeft, top: popTop }} onPointerDown={(e) => e.stopPropagation()}>
             <textarea
               autoFocus
-              placeholder="Generate: describe the change. Extract: name the element (optional, e.g. “the gold ring”)."
+              placeholder={
+                activeGuide
+                  ? `Restyle to “${activeGuide.name}” needs no prompt — type only if you want an extra instruction on top.`
+                  : 'Generate: describe the change. Extract: name the element (optional, e.g. “the gold ring”).'
+              }
               value={promptText}
               onChange={(e) => setPromptText(e.target.value)}
               onKeyDown={(e) => {
@@ -1418,6 +1480,87 @@ export default function Canvas({
               </div>
             ) : null}
             {err ? <div className="prompt-err">{err}</div> : null}
+
+            {/* Built-in style guides: pick one, preview exactly what will be sent, hit Restyle. */}
+            <div className="sg-row">
+              <span className="pr-label">Style</span>
+              <select className="sg-select" value={guideId} onChange={(e) => setGuideId(e.target.value)}>
+                <option value="">No style guide</option>
+                {STYLE_GUIDES.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+              {activeGuide ? (
+                <button className="sg-info" onClick={() => setGuidePreview((v) => !v)} title="What this style guide is, and the exact prompt it sends">
+                  {guidePreview ? '▾' : '▸'} Preview
+                </button>
+              ) : null}
+            </div>
+            {activeGuide ? (
+              <>
+                <div className="sg-blurb">{activeGuide.blurb}</div>
+                {/* Materials: pick precisely which parts of the direction to apply. */}
+                <div className="sg-mats">
+                  {activeGuide.materials.map((m) => {
+                    const on = activeMaterials.includes(m.id)
+                    return (
+                      <button
+                        key={m.id}
+                        className={'sg-mat' + (on ? ' on' : '')}
+                        onClick={() => toggleMaterial(m.id)}
+                        title={`${m.name} — ${m.blurb}\n\nClick to ${on ? 'exclude from' : 'include in'} the restyle.`}
+                      >
+                        <span className="sg-mat-dots">
+                          {m.ramp.slice(2, 8).map(([hex]) => (
+                            <i key={hex} style={{ background: hex }} />
+                          ))}
+                        </span>
+                        {m.name}
+                      </button>
+                    )
+                  })}
+                </div>
+              </>
+            ) : null}
+            {activeGuide && guidePreview ? (
+              <div className="sg-preview">
+                <div className="sg-sec">Reference art attached ({refsFor(activeGuide, activeMaterials).length} of {activeGuide.refs.length} — only refs whose materials are all selected)</div>
+                <div className="sg-refs">
+                  {refsFor(activeGuide, activeMaterials).map((r) => (
+                    <span key={r.label} className="sg-ref" title={`${r.label} — ${r.why}`}>
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={r.src} alt="" />
+                      <em>{r.label}</em>
+                    </span>
+                  ))}
+                </div>
+                {activeGuide.materials
+                  .filter((m) => activeMaterials.includes(m.id))
+                  .map((m) => (
+                    <div key={m.id}>
+                      <div className="sg-sec">{m.name}</div>
+                      <div className="sg-desc">{m.description}</div>
+                      <div className="sg-swatches">
+                        {m.ramp.map(([hex, role]) => (
+                          <span key={hex} className="sg-sw" title={`${hex} — ${role}`}>
+                            <i style={{ background: hex }} />
+                            {hex}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                <div className="sg-sec">Across every material</div>
+                <div className="sg-desc">{activeGuide.description}</div>
+                <div className="sg-sec">
+                  Exact prompt sent{promptText.trim() ? ' (including your extra instruction)' : ''}
+                </div>
+                <pre className="sg-prompt">{buildRestylePrompt(activeGuide, activeMaterials, promptText)}</pre>
+              </div>
+            ) : null}
+
             {refPick ? <div className="prompt-tip refpick">Drag a box on any image to add it as a reference · Esc to cancel</div> : null}
             <div className="prompt-refs">
               <span className="pr-label">Refs</span>
@@ -1462,9 +1605,11 @@ export default function Canvas({
               </label>
             </div>
             <div className="prompt-tip extract-hint">
-              {extractMode === 'background'
-                ? 'Extract → Background only: deletes the panels, icons and text and keeps just the scene behind them (opaque). Best on the whole frame.'
-                : 'Extract → Isolate element: cuts the one element you name out on a transparent background (text removed).'}
+              {activeGuide
+                ? `Restyle: re-renders the WHOLE image in ${activeMaterials.length === activeGuide.materials.length ? `the full “${activeGuide.name}” direction` : activeGuide.materials.filter((m) => activeMaterials.includes(m.id)).map((m) => m.name).join(' + ')} — reference art attached automatically. Runs ${count > 1 ? `${count} takes` : 'once'}; a reference can occasionally hijack a take, so generating a few and picking is normal.`
+                : extractMode === 'background'
+                  ? 'Extract → Background only: deletes the panels, icons and text and keeps just the scene behind them (opaque). Best on the whole frame.'
+                  : 'Extract → Isolate element: cuts the one element you name out on a transparent background (text removed).'}
             </div>
             <div className="prompt-actions">
               <button className="btn" onClick={cancelPrompt}>
@@ -1481,9 +1626,19 @@ export default function Canvas({
               >
                 {count > 1 ? `Extract ${count}` : 'Extract'}
               </button>
-              <button className="btn primary" onClick={runEdit} disabled={!promptText.trim() && references.length === 0}>
-                {count > 1 ? `Generate ${count}` : 'Generate'}
-              </button>
+              {activeGuide ? (
+                <button
+                  className="btn primary"
+                  onClick={runRestyle}
+                  title={`Re-render this whole image in the “${activeGuide.name}” style guide — no prompt needed`}
+                >
+                  {count > 1 ? `Restyle ${count}` : 'Restyle'}
+                </button>
+              ) : (
+                <button className="btn primary" onClick={runEdit} disabled={!promptText.trim() && references.length === 0}>
+                  {count > 1 ? `Generate ${count}` : 'Generate'}
+                </button>
+              )}
             </div>
           </div>
         ) : null}
@@ -1595,8 +1750,26 @@ export default function Canvas({
             <button className="tbtn" title="Select the whole frame, then type what to Extract or Generate" onClick={() => setSelection(fullFrame(liveNode))}>
               Whole frame
             </button>
-            <button className="tbtn" title="Remove the background: keep the subject, make everything behind it transparent" onClick={() => doRemoveBg(liveNode)}>
+            <button
+              className="tbtn"
+              title="Remove BG (mechanical): instant flood-fill for a solid/flat background — no model, exact edges, keeps enclosed windows transparent"
+              onClick={() => doRemoveBg(liveNode, 'mechanical')}
+            >
               Remove BG
+            </button>
+            <button
+              className="tbtn"
+              title="Remove BG (AI): uses the model to cut the subject from a photographic / complex background"
+              onClick={() => doRemoveBg(liveNode, 'ai')}
+            >
+              Remove BG (AI)
+            </button>
+            <button
+              className="tbtn"
+              title="Remove BG (Precise): a local matting network (U²-Net, WebGPU) — Figma-style soft-edged cutout for photographic subjects; runs on your machine"
+              onClick={() => doRemoveBg(liveNode, 'matte')}
+            >
+              Remove BG (Precise)
             </button>
             <button className="tbtn" title="Save this image as a PNG file" onClick={() => savePngFor(liveNode)}>
               Save PNG

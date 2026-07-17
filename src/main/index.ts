@@ -121,7 +121,7 @@ function makeZip(files: { name: string; data: Buffer }[]): Buffer {
 
 function registerIpc(): void {
   // --- Gemini (never exposes the key to the renderer) ---
-  ipcMain.handle('gemini:generate', async (_e, opts: { prompt: string; images: string[]; model: string }) => {
+  ipcMain.handle('gemini:generate', async (_e, opts: { prompt: string; images: string[]; model: string; aspectRatio?: string }) => {
     try {
       const image = await geminiGenerate(opts)
       return { image }

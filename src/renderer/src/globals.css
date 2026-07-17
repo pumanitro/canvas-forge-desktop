@@ -120,6 +120,10 @@ button {
 
 /* Project cards (with thumbnail preview) */
 .proj-card {
+  /* A column flex item shrinks by default: once the list overflows, every card
+     squashes down onto its fixed-height thumbnail and `overflow: hidden` clips the
+     name strip away. Hold the intrinsic height so .proj-list scrolls instead. */
+  flex-shrink: 0;
   border-radius: 10px;
   border: 1px solid var(--line);
   background: var(--panel-2);
@@ -731,6 +735,174 @@ button {
 }
 .prompt-tip.refpick {
   color: #23c3a6;
+}
+
+/* Built-in style guides: picker + preview */
+.sg-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sg-row .pr-label {
+  color: var(--muted);
+  font-size: 12px;
+}
+.sg-select {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 6px;
+}
+.sg-select:hover {
+  border-color: var(--accent);
+}
+.sg-info {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 4px;
+  flex: 0 0 auto;
+}
+.sg-info:hover {
+  color: var(--accent-2);
+}
+.sg-blurb {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  margin-top: -2px;
+}
+/* Material toggles — which parts of the direction to apply */
+.sg-mats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.sg-mat {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 11px;
+  padding: 3px 9px 3px 5px;
+  opacity: 0.5;
+}
+.sg-mat:hover {
+  border-color: #3a3f4e;
+}
+.sg-mat.on {
+  opacity: 1;
+  color: var(--text);
+  border-color: var(--accent);
+}
+/* A tiny slice of the material's real ramp, so the chip shows what it IS */
+.sg-mat-dots {
+  display: flex;
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+.sg-mat-dots i {
+  width: 5px;
+  height: 11px;
+}
+.sg-mat:not(.on) .sg-mat-dots {
+  filter: grayscale(1);
+}
+
+.sg-preview {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0a0b0f;
+  padding: 8px;
+  /* The description + full prompt are long by design — this panel scrolls, the popover doesn't. */
+  max-height: 260px;
+  overflow-y: auto;
+}
+.sg-sec {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin: 8px 0 4px;
+}
+.sg-sec:first-child {
+  margin-top: 0;
+}
+.sg-refs {
+  display: flex;
+  gap: 6px;
+}
+.sg-ref {
+  flex: 0 0 auto;
+  width: 56px;
+  text-align: center;
+}
+.sg-ref img {
+  width: 56px;
+  height: 56px;
+  object-fit: contain;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #17181d;
+  display: block;
+}
+.sg-ref em {
+  display: block;
+  font-style: normal;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.2;
+  margin-top: 3px;
+}
+.sg-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.sg-sw {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 5px;
+  color: var(--muted);
+  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.sg-sw i {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+.sg-desc {
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+.sg-prompt {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  background: #05060a;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px;
 }
 
 /* Reference images strip in the prompt box */
