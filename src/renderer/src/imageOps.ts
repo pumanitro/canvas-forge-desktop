@@ -506,37 +506,81 @@ function keyOutUniformBg(ctx: CanvasRenderingContext2D, W: number, H: number, bg
   ctx.putImageData(id, 0, 0)
 }
 
-// A saliency matte has no concept of "inside the subject". U²-Net scores a large, flat,
+// A saliency matte has no concept of "inside the subject". The network scores a large, flat,
 // low-contrast area — a parchment panel, a plain shield face — as weakly salient and punches
 // holes clean through the middle of it, which no amount of edge refinement can repair.
 //
-// But over a near-uniform backdrop we know something the network doesn't: a pixel sitting far
-// from ANY backdrop-coloured pixel cannot be background, whatever its saliency score. So seed a
-// distance transform at every backdrop-coloured pixel and force everything beyond BAND of one
-// back to opaque. The matte still owns the narrow band around the real cut — which is the only
-// place its soft edge was ever worth having — and enclosed backdrop regions (an empty art window
-// inside a frame) are seeds themselves, so they stay cut.
+// The repair uses something the network doesn't know: real background reaches the frame edge,
+// whereas a hole is landlocked inside the subject. So work out which pixels are genuinely
+// background, then force everything else back to opaque.
+//
+// Identifying background by colour-match alone (distance to the average corner colour) is NOT
+// enough, and fails in a way that looks like the tool is broken. A photographic backdrop is
+// usually a gradient: its brighter areas sit far from the corner average, are never recognised as
+// background, and — being landlocked by that very mistake — get forced OPAQUE, welding a slab of
+// leftover backdrop onto the cutout. Four agreeing corners do not imply a uniform backdrop; a
+// dark-cornered gradient passes that test easily.
+//
+// So a pixel counts as background if EITHER
+//   (a) it is reachable from the frame edge through pixels the matte already calls background
+//       (handles gradients, vignettes, any non-uniform backdrop), or
+//   (b) it closely matches the sampled backdrop colour (keeps an enclosed empty window — an art
+//       slot inside a frame — eligible to stay cut, though it never touches the edge).
+// Anything further than BAND from that set is interior and is restored to opaque. The band is what
+// preserves the soft edge the matte just worked to produce.
 function protectInterior(alpha: Float32Array, W: number, H: number, src: Uint8ClampedArray, bg: number[], BAND = 4): void {
   const N = W * H
   const HI = 200 // same colour-distance cut-off the mechanical engine keys on
-  const dist = new Int16Array(N).fill(-1)
+  const bgish = (i: number): boolean =>
+    Math.abs(src[i * 4] - bg[0]) + Math.abs(src[i * 4 + 1] - bg[1]) + Math.abs(src[i * 4 + 2] - bg[2]) < HI
+
+  // (a) flood inward from the frame edge through matte-transparent (or backdrop-coloured) pixels
+  const isBg = new Uint8Array(N)
   const q: number[] = []
-  for (let i = 0; i < N; i++) {
-    const dd = Math.abs(src[i * 4] - bg[0]) + Math.abs(src[i * 4 + 1] - bg[1]) + Math.abs(src[i * 4 + 2] - bg[2])
-    if (dd < HI) {
-      dist[i] = 0
+  const seed = (i: number): void => {
+    if (!isBg[i] && (alpha[i] < 0.5 || bgish(i))) {
+      isBg[i] = 1
       q.push(i)
     }
   }
+  for (let x = 0; x < W; x++) {
+    seed(x)
+    seed((H - 1) * W + x)
+  }
+  for (let y = 0; y < H; y++) {
+    seed(y * W)
+    seed(y * W + W - 1)
+  }
   for (let head = 0; head < q.length; head++) {
     const i = q[head]
+    const x = i % W
+    const nb = [x > 0 ? i - 1 : -1, x < W - 1 ? i + 1 : -1, i >= W ? i - W : -1, i < N - W ? i + W : -1]
+    for (const j of nb) if (j >= 0) seed(j)
+  }
+  // (b) enclosed regions matching the backdrop colour. Colour alone decides here — NOT "colour and
+  // the matte agrees" — because the case this exists for is the one where the matte is wrong: it
+  // reads an empty window inside a frame as part of the solid object. Gating on the matte's opinion
+  // would mean this branch silently never fires.
+  for (let i = 0; i < N; i++) if (!isBg[i] && bgish(i)) isBg[i] = 1
+
+  // distance transform out of the background set; anything unreached within BAND is interior
+  const dist = new Int16Array(N).fill(-1)
+  const dq: number[] = []
+  for (let i = 0; i < N; i++) {
+    if (isBg[i]) {
+      dist[i] = 0
+      dq.push(i)
+    }
+  }
+  for (let head = 0; head < dq.length; head++) {
+    const i = dq[head]
     if (dist[i] >= BAND) continue
     const x = i % W
     const nb = [x > 0 ? i - 1 : -1, x < W - 1 ? i + 1 : -1, i >= W ? i - W : -1, i < N - W ? i + W : -1]
     for (const j of nb) {
       if (j >= 0 && dist[j] === -1) {
         dist[j] = dist[i] + 1
-        q.push(j)
+        dq.push(j)
       }
     }
   }
