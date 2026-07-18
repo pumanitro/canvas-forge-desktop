@@ -2,11 +2,6 @@
 
 import type { Project } from './types'
 
-declare module '*.onnx?url' {
-  const src: string
-  export default src
-}
-
 // Bundled style-guide reference art, inlined as a base64 data URL at build time.
 declare module '*.png?inline' {
   const src: string
@@ -20,6 +15,8 @@ declare global {
       loadProjects: () => Promise<Project[]>
       saveProject: (p: Project) => Promise<unknown>
       deleteProject: (id: string) => Promise<unknown>
+      loadProjectOrder: () => Promise<string[]>
+      saveProjectOrder: (ids: string[]) => Promise<unknown>
       loadPrompts: () => Promise<string[]>
       addPrompt: (p: string) => Promise<string[]>
       getSettings: () => Promise<{ geminiKey?: string; hasKey: boolean }>
@@ -31,6 +28,10 @@ declare global {
       exportZip: (items: { name: string; dataUrl: string }[], name: string) => Promise<{ path?: string; count?: number; canceled?: boolean; error?: string }>
       copyImage: (dataUrl: string) => Promise<{ ok?: boolean; error?: string }>
       detect: (opts: { image: string; description: string }) => Promise<{ box?: [number, number, number, number] | null; error?: string }>
+      matteStatus: (id: string) => Promise<{ ready: boolean; size: number }>
+      matteEnsure: (id: string) => Promise<{ ok: boolean; error?: string }>
+      matteRun: (id: string, rgba: Uint8Array) => Promise<{ alpha?: Float32Array; error?: string }>
+      onMatteProgress: (cb: (p: { id: string; progress: number }) => void) => () => void
     }
   }
 }

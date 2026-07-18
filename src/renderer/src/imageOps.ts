@@ -506,6 +506,43 @@ function keyOutUniformBg(ctx: CanvasRenderingContext2D, W: number, H: number, bg
   ctx.putImageData(id, 0, 0)
 }
 
+// A saliency matte has no concept of "inside the subject". U²-Net scores a large, flat,
+// low-contrast area — a parchment panel, a plain shield face — as weakly salient and punches
+// holes clean through the middle of it, which no amount of edge refinement can repair.
+//
+// But over a near-uniform backdrop we know something the network doesn't: a pixel sitting far
+// from ANY backdrop-coloured pixel cannot be background, whatever its saliency score. So seed a
+// distance transform at every backdrop-coloured pixel and force everything beyond BAND of one
+// back to opaque. The matte still owns the narrow band around the real cut — which is the only
+// place its soft edge was ever worth having — and enclosed backdrop regions (an empty art window
+// inside a frame) are seeds themselves, so they stay cut.
+function protectInterior(alpha: Float32Array, W: number, H: number, src: Uint8ClampedArray, bg: number[], BAND = 4): void {
+  const N = W * H
+  const HI = 200 // same colour-distance cut-off the mechanical engine keys on
+  const dist = new Int16Array(N).fill(-1)
+  const q: number[] = []
+  for (let i = 0; i < N; i++) {
+    const dd = Math.abs(src[i * 4] - bg[0]) + Math.abs(src[i * 4 + 1] - bg[1]) + Math.abs(src[i * 4 + 2] - bg[2])
+    if (dd < HI) {
+      dist[i] = 0
+      q.push(i)
+    }
+  }
+  for (let head = 0; head < q.length; head++) {
+    const i = q[head]
+    if (dist[i] >= BAND) continue
+    const x = i % W
+    const nb = [x > 0 ? i - 1 : -1, x < W - 1 ? i + 1 : -1, i >= W ? i - W : -1, i < N - W ? i + W : -1]
+    for (const j of nb) {
+      if (j >= 0 && dist[j] === -1) {
+        dist[j] = dist[i] + 1
+        q.push(j)
+      }
+    }
+  }
+  for (let i = 0; i < N; i++) if (dist[i] === -1) alpha[i] = 1
+}
+
 // Remove background: keep the whole subject exactly (pixels, position, resolution, padding) and cut
 // everything behind it — AND any enclosed empty window — to transparency. Two engines:
 //   'mechanical' — deterministic flood-fill of the (uniform) background colour: no model, so it is
@@ -525,16 +562,6 @@ export async function imageRemoveBg(p: {
   const out = makeCanvas(W, H)
   out.ctx.drawImage(img, 0, 0)
 
-  // PRECISE: a real matting network predicts a soft foreground alpha; apply it straight to the
-  // original (no colour key, no defringe needed — the matte is already soft-edged).
-  if (p.mode === 'matte') {
-    const alpha = await matteAlpha(img, W, H)
-    const id = out.ctx.getImageData(0, 0, W, H)
-    for (let i = 0; i < W * H; i++) id.data[i * 4 + 3] = Math.round(alpha[i] * 255)
-    out.ctx.putImageData(id, 0, 0)
-    return out.cv.toDataURL('image/png')
-  }
-
   // Sample the four corners → background colour + how uniform it is.
   const c0 = out.ctx.getImageData(0, 0, W, H).data
   const corners = [
@@ -548,6 +575,24 @@ export async function imageRemoveBg(p: {
   })
   const bg = [0, 1, 2].map((c) => Math.round(corners.reduce((s, pp) => s + pp[c], 0) / 4))
   const spread = Math.max(...corners.map((pp) => Math.abs(pp[0] - bg[0]) + Math.abs(pp[1] - bg[1]) + Math.abs(pp[2] - bg[2])))
+
+  // PRECISE: a real matting network predicts a soft foreground alpha, guided-filtered to the
+  // original's edges. Applying it is not the whole job, though — a partly transparent edge pixel
+  // still holds a COLOUR that is a blend of subject and old background (I = αF + (1-α)B). Attach
+  // alpha alone and that (1-α)B term travels with the cutout, so compositing it over anything else
+  // leaves a rim of the background it was cut from: dark on a dark backdrop, bright on a light one.
+  // decontaminateEdges solves for F by pushing opaque subject colour outward through the soft band,
+  // which is the same job as Photoshop's "Decontaminate Colors". protectInterior runs first, and
+  // only over a uniform backdrop, to repair holes the saliency net punches through flat interiors.
+  if (p.mode === 'matte') {
+    const alpha = await matteAlpha(img, W, H)
+    const id = out.ctx.getImageData(0, 0, W, H)
+    if (spread < 80) protectInterior(alpha, W, H, id.data, bg)
+    for (let i = 0; i < W * H; i++) id.data[i * 4 + 3] = Math.round(alpha[i] * 255)
+    out.ctx.putImageData(id, 0, 0)
+    decontaminateEdges(out.ctx, W, H)
+    return out.cv.toDataURL('image/png')
+  }
 
   const mode = p.mode ?? 'auto'
   const mechanical = mode === 'mechanical' || (mode === 'auto' && spread < 48)

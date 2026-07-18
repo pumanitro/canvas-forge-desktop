@@ -5,6 +5,7 @@ import { clamp, uid } from './util'
 import { addPrompt, loadPrompts } from './store'
 import { imageEdit, imageExtract, imageExtractBackground, imageRemoveBg, imageRestyle } from './imageOps'
 import { STYLE_GUIDES, buildRestylePrompt, refsFor } from './styleguides'
+import { ensureMatteModel, matteModelReady, onMatteProgress } from './matte'
 
 type View = { x: number; y: number; zoom: number }
 type Tool = 'move' | 'rect' | 'draw' | 'magic'
@@ -180,6 +181,9 @@ export default function Canvas({
   }, [brushScreen])
   const [hover, setHover] = useState<Pt | null>(null)
   const [copyToast, setCopyToast] = useState<string | null>(null)
+  // 0..1 while the matting model is downloading on first use, else null. The model is 224 MB, so
+  // without this the first "Remove BG (Precise)" click would look like the app had hung.
+  const [matteDl, setMatteDl] = useState<number | null>(null)
   // path of the last-saved PNG → drives the "Saved · Reveal in Finder" toast
   const [savedPath, setSavedPath] = useState<string | null>(null)
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -1024,10 +1028,28 @@ export default function Canvas({
   //   'mechanical' — deterministic flood-fill (instant, solid backgrounds)
   //   'ai'         — the model handles photographic / complex backgrounds
   const doRemoveBg = useCallback(
-    (n: ImageNode, mode: 'mechanical' | 'ai' | 'matte' = 'mechanical') => {
+    async (n: ImageNode, mode: 'mechanical' | 'ai' | 'matte' = 'mechanical') => {
       const src = n.src
       const mdl = model
       const gap = Math.max(24, n.w * 0.05)
+
+      // The precise engine needs its network on disk. Fetch it before dispatching the job so the
+      // one-time download reports progress instead of stalling inside a loading placeholder.
+      if (mode === 'matte' && !(await matteModelReady())) {
+        const off = onMatteProgress(setMatteDl)
+        setMatteDl(0)
+        try {
+          await ensureMatteModel()
+        } catch (e) {
+          setCopyToast(e instanceof Error ? e.message : 'Could not download the matting model')
+          setTimeout(() => setCopyToast(null), 4000)
+          return
+        } finally {
+          off()
+          setMatteDl(null)
+        }
+      }
+
       runGeneration({
         perform: () => imageRemoveBg({ src, model: mdl, mode }),
         prompt: '',
@@ -1766,7 +1788,7 @@ export default function Canvas({
             </button>
             <button
               className="tbtn"
-              title="Remove BG (Precise): a local matting network (U²-Net, WebGPU) — Figma-style soft-edged cutout for photographic subjects; runs on your machine"
+              title="Remove BG (Precise): a local matting network (BiRefNet) with guided-filter edge refinement — soft-edged cutout for photographic subjects; runs on your machine (one-time 224 MB model download)"
               onClick={() => doRemoveBg(liveNode, 'matte')}
             >
               Remove BG (Precise)
@@ -1880,6 +1902,9 @@ export default function Canvas({
       </button>
 
       {copyToast ? <div className="toast">{copyToast}</div> : null}
+      {matteDl !== null ? (
+        <div className="toast">Downloading matting model… {Math.round(matteDl * 100)}%</div>
+      ) : null}
       {savedPath ? (
         <div className="toast saved-toast">
           <span className="saved-msg">

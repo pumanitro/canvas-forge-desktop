@@ -4,6 +4,7 @@ import { join } from 'path'
 
 // Real files on disk under the app's userData dir:
 //   Projects/<id>.json   one file per project (self-contained, with embedded images)
+//   projectOrder.json    sidebar order, as a bare list of project ids
 //   prompts.json         recent prompt history
 //   settings.json        { geminiKey }
 
@@ -34,6 +35,27 @@ export function saveProject(p: { id: string }): void {
 export function deleteProject(id: string): void {
   const f = join(projectsDir(), `${id}.json`)
   if (existsSync(f)) unlinkSync(f)
+}
+
+// The sidebar order lives in its own file rather than as a field on each project:
+// project JSONs embed their images and run to megabytes, so rewriting every one of
+// them just to swap two cards would be absurd. This is a bare id list — ids that no
+// longer exist are ignored on load, so deletes need no bookkeeping here.
+function orderPath(): string {
+  return join(app.getPath('userData'), 'projectOrder.json')
+}
+
+export function loadProjectOrder(): string[] {
+  try {
+    const v = JSON.parse(readFileSync(orderPath(), 'utf8'))
+    return Array.isArray(v) ? (v as string[]) : []
+  } catch {
+    return []
+  }
+}
+
+export function saveProjectOrder(ids: string[]): void {
+  writeFileSync(orderPath(), JSON.stringify(ids))
 }
 
 function promptsPath(): string {

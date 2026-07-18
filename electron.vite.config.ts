@@ -3,7 +3,18 @@ import { defineConfig } from 'electron-vite'
 import react from '@vitejs/plugin-react'
 
 export default defineConfig({
-  main: {},
+  main: {
+    build: {
+      rollupOptions: {
+        // The matting worker is forked as its own process, so it needs to be emitted as a second
+        // entry rather than folded into index.js.
+        input: {
+          index: resolve('src/main/index.ts'),
+          matteWorker: resolve('src/main/matteWorker.ts')
+        }
+      }
+    }
+  },
   preload: {},
   renderer: {
     // Pin the dev renderer to its own port so it never collides with another Vite

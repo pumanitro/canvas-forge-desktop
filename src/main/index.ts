@@ -4,7 +4,18 @@ import { writeFileSync, readFileSync } from 'fs'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { geminiGenerate, geminiDetect, hasKey } from './gemini'
-import { loadProjects, saveProject, deleteProject, loadPrompts, addPrompt, getSettings, setSetting } from './store'
+import {
+  loadProjects,
+  saveProject,
+  deleteProject,
+  loadProjectOrder,
+  saveProjectOrder,
+  loadPrompts,
+  addPrompt,
+  getSettings,
+  setSetting
+} from './store'
+import { ensureModel, matteInputSize, modelReady, runMatte, shutdownMatte, type ModelId } from './matte'
 
 // DEV ONLY: expose a Chrome DevTools Protocol endpoint so the app can be driven /
 // inspected/tested over CDP (like a browser tab). Never enabled in a packaged build.
@@ -143,6 +154,8 @@ function registerIpc(): void {
   ipcMain.handle('projects:load', () => loadProjects())
   ipcMain.handle('projects:save', (_e, p) => saveProject(p))
   ipcMain.handle('projects:delete', (_e, id: string) => deleteProject(id))
+  ipcMain.handle('projects:loadOrder', () => loadProjectOrder())
+  ipcMain.handle('projects:saveOrder', (_e, ids: string[]) => saveProjectOrder(ids))
   ipcMain.handle('prompts:load', () => loadPrompts())
   ipcMain.handle('prompts:add', (_e, p: string) => addPrompt(p))
   ipcMain.handle('settings:get', () => ({ ...getSettings(), hasKey: hasKey() }))
@@ -240,6 +253,33 @@ function registerIpc(): void {
     if (filePath) shell.showItemInFolder(filePath)
     return { ok: true }
   })
+
+  // --- background-removal matting -------------------------------------------------------------
+  // The good model is 224 MB, so it is fetched on first use rather than committed. The renderer
+  // asks what's on disk, triggers the download (with progress), then submits pixels.
+  ipcMain.handle('matte:status', (_e, id: ModelId) => ({
+    ready: modelReady(id),
+    size: matteInputSize(id)
+  }))
+
+  ipcMain.handle('matte:ensure', async (e, id: ModelId) => {
+    try {
+      await ensureModel(id, (p) => {
+        if (!e.sender.isDestroyed()) e.sender.send('matte:progress', { id, progress: p })
+      })
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle('matte:run', async (_e, { id, rgba }: { id: ModelId; rgba: Uint8Array }) => {
+    try {
+      return { alpha: await runMatte(id, rgba) }
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) }
+    }
+  })
 }
 
 // Only allow ONE instance — a second launch just focuses the existing window.
@@ -257,6 +297,9 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(() => {
     electronApp.setAppUserModelId('com.canvasforge')
+    // On macOS the bundle's .icns supplies the dock icon, but an unpackaged run has no
+    // bundle — without this, `npm run dev` shows the stock Electron icon instead of ours.
+    if (process.platform === 'darwin' && !app.isPackaged) app.dock?.setIcon(icon)
     app.on('browser-window-created', (_, window) => optimizer.watchWindowShortcuts(window))
     buildAppMenu()
     registerIpc()
@@ -265,6 +308,9 @@ if (!app.requestSingleInstanceLock()) {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()
     })
   })
+
+  // The matting worker is a detached child; without this it outlives the app on quit.
+  app.on('before-quit', () => shutdownMatte())
 }
 
 app.on('window-all-closed', () => {

@@ -116,6 +116,7 @@ button {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  position: relative; /* scroll-space anchor for .drop-line */
 }
 
 /* Project cards (with thumbnail preview) */
@@ -128,7 +129,11 @@ button {
   border: 1px solid var(--line);
   background: var(--panel-2);
   overflow: hidden;
-  cursor: pointer;
+  cursor: grab; /* the card is draggable to reorder; grabbing state is on .dragging */
+  user-select: none; /* dragging across cards must not rubber-band-select their names */
+}
+.proj-foot .name-input {
+  user-select: text;
 }
 .proj-card:hover {
   border-color: #3a3f4e;
@@ -195,6 +200,31 @@ button {
 }
 .proj-foot .x:hover {
   color: var(--danger);
+}
+
+/* Drag to reorder: the carried card lifts and follows the cursor, the rest slide one slot
+   out of its way, and a dashed slot shows exactly where it lands. Everything moves by
+   transform — no reflow — so the layout snapshot the drop is measured against stays true. */
+.proj-card {
+  transition: transform 150ms cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+.proj-card.dragging {
+  transition: none; /* the carried card must track the pointer 1:1, with no easing lag */
+  cursor: grabbing;
+  border-color: var(--accent);
+  box-shadow:
+    0 14px 30px rgba(0, 0, 0, 0.55),
+    0 0 0 1px var(--accent);
+}
+.drop-slot {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  border: 2px dashed var(--accent);
+  border-radius: 10px;
+  background: rgba(124, 92, 255, 0.11);
+  pointer-events: none;
+  z-index: 1;
 }
 
 .proj {

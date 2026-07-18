@@ -11,14 +11,22 @@ files:
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
 asarUnpack:
   - resources/**
+  # ONNX Runtime's .node addon and its libonnxruntime dylib/so must be real files on disk — the
+  # dynamic loader cannot open a library from inside the asar archive.
+  - '**/node_modules/onnxruntime-node/**'
 win:
   executableName: canvas-forge-desktop
+  # onnxruntime-node ships prebuilt binaries for every platform (~40 MB each); keep only this one's.
+  files:
+    - '!**/node_modules/onnxruntime-node/bin/napi-v6/{darwin,linux}/**'
 nsis:
   artifactName: ${name}-${version}-setup.${ext}
   shortcutName: ${productName}
   uninstallDisplayName: ${productName}
   createDesktopShortcut: always
 mac:
+  files:
+    - '!**/node_modules/onnxruntime-node/bin/napi-v6/{win32,linux}/**'
   entitlementsInherit: build/entitlements.mac.plist
   extendInfo:
     - NSCameraUsageDescription: Application requests access to the device's camera.
@@ -29,6 +37,8 @@ mac:
 dmg:
   artifactName: ${name}-${version}.${ext}
 linux:
+  files:
+    - '!**/node_modules/onnxruntime-node/bin/napi-v6/{darwin,win32}/**'
   target:
     - AppImage
     - snap

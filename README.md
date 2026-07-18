@@ -7,7 +7,7 @@
 
 A desktop **infinite canvas for AI image editing**. Paste an image, select any region, describe a change, and Gemini regenerates *only* that region in place. Built for game‑UI and asset work: extract elements onto transparency, remove backgrounds, restyle from references, run many edits at once, and save straight to disk.
 
-Canvas Forge is an Electron app (macOS‑first) built with electron‑vite + React + TypeScript. All image processing runs locally in the renderer via the 2D canvas (no native modules); the Google Gemini API is called from the main process so your API key never touches the renderer.
+Canvas Forge is an Electron app (macOS‑first) built with electron‑vite + React + TypeScript. Image processing runs locally in the renderer via the 2D canvas; the one exception is the precise background‑removal matting network, which runs natively in a worker process (see below). The Google Gemini API is called from the main process so your API key never touches the renderer.
 
 ## Features
 
@@ -18,7 +18,7 @@ Canvas Forge is an Electron app (macOS‑first) built with electron‑vite + Rea
 - **References that don't warp your image.** Box‑select regions of any image as visual guides for a generation. References are letterboxed to the artwork's aspect ratio before being sent — otherwise Gemini shapes its output after them and the result comes back stretched. An aspect guard fails loudly instead of compositing a squashed result.
 - **Whole‑frame restyle.** Double‑click a frame to select it edge‑to‑edge, attach a reference, and re‑render the subject in the reference's style; the result is contain‑fitted to the original resolution, never distorted.
 - **Extract, two algorithms.** *Isolate element* cuts the named element onto a transparent background with text removed; *Background only* deletes the foreground + text and keeps the reconstructed background scene.
-- **Remove background.** One click keeps the subject and cuts everything behind it to transparency (Gemini paints the background magenta, then it's chroma‑keyed out). Always a single, deterministic result.
+- **Remove background, three engines.** *Remove BG* flood‑fills a flat background (instant, exact, no model). *Remove BG (AI)* has Gemini paint the background magenta and chroma‑keys it out, for complex scenes. *Remove BG (Precise)* runs a real matting network — **BiRefNet** at 1024×1024 — locally, then refines the mask against the original with a guided filter so edges follow actual hair and contours instead of a blurred silhouette. Always a single, deterministic result.
 - **1–10 variations** per run, laid out side by side. **Model choice:** Best (Gemini 3 Pro Image / "Nano Banana Pro", best text fidelity) or Fast (Gemini 2.5 Flash Image).
 
 ### Concurrency
@@ -64,7 +64,15 @@ npm run build:mac     # package a macOS app (electron‑builder)
 
 ## Tech stack
 
-electron‑vite · Electron · React · TypeScript · Google Gemini image API. Image processing (crop, feathered‑mask composite, magenta chroma‑key, reference letterboxing) is done with the 2D canvas, deliberately no `sharp` / native modules, to keep packaging simple. The dev renderer is pinned to port 6771 so it never collides with another Vite project.
+electron‑vite · Electron · React · TypeScript · Google Gemini image API. Image processing (crop, feathered‑mask composite, magenta chroma‑key, reference letterboxing, guided‑filter matte refinement) is done with the 2D canvas — no `sharp`. The dev renderer is pinned to port 6771 so it never collides with another Vite project.
+
+### Precise background removal
+
+The matting network is the one native dependency (`onnxruntime-node`). It runs in a forked worker process rather than the renderer or the main process, for three reasons: the renderer can only reach ONNX Runtime through single‑threaded WebAssembly (~53 s per image at 1024² versus ~4 s native — a packaged `file://` renderer can't be cross‑origin isolated, so threaded WASM is unavailable); inference blocks for seconds, which would freeze main; and the model is ~500 MB resident, so a worker can be dropped after five idle minutes.
+
+The model is **BiRefNet lite** (MIT, 224 MB), downloaded from Hugging Face on first use into `userData/Models/` and cached. Until it arrives, a bundled 4.5 MB U²‑Netp acts as an offline fallback. BRIA's RMBG models are deliberately *not* used: they score well but are CC BY‑NC, which is incompatible with this project's MIT licence.
+
+Two ONNX Runtime session options are load‑bearing and must not be removed — see the comment in `src/main/matteWorker.ts`. Electron replaces the global allocator with V8's, which traps instead of failing soft on the large contiguous blocks ORT wants; without `enableCpuMemArena: false` the first run crashes, and without `enableMemPattern: false` the *second* run crashes.
 
 ## License
 
