@@ -143,6 +143,12 @@ export default function Canvas({
   const [history, setHistory] = useState<string[]>([])
   const [model, setModel] = useState('gemini-3-pro-image')
   const [count, setCount] = useState(1)
+  // Per-run prompts. OFF ⇒ every run gets the identical prompt (the model's own sampling is the
+  // only thing that differs — the long-standing behaviour, and still the default). ON ⇒ each run
+  // carries its own editable prompt, so a batch explores different ideas instead of resampling one.
+  // Sticky like the style guide; the rows themselves are refilled per selection.
+  const [varyOn, setVaryOn] = useState(false)
+  const [variants, setVariants] = useState<{ text: string; on: boolean }[]>([])
   const [extractMode, setExtractMode] = useState<ExtractMode>('isolate') // what the Extract button does
   const [showHistory, setShowHistory] = useState(false) // recent-prompt chips collapsed by default
   // Built-in style guide: '' = none. Sticky across runs (unlike the prompt box and refs, which
@@ -258,7 +264,70 @@ export default function Canvas({
     setReferences([])
     setRefPick(false)
     setRefMarq(null)
+    setVariants([]) // next selection refills the rows from its own prompt
   }, [setMarq, setStrokePts, setRefMarq])
+
+  // Keep one row per run. Existing rows survive a Runs change (your edits aren't thrown away);
+  // new rows are seeded with whatever is in the main prompt box. Returning `prev` unchanged when
+  // the length already matches lets React bail out, so typing in the prompt box costs nothing.
+  const promptRef = useRef(promptText)
+  useEffect(() => {
+    promptRef.current = promptText
+  }, [promptText])
+  useEffect(() => {
+    if (!varyOn) return
+    setVariants((prev) =>
+      prev.length === count
+        ? prev
+        : Array.from({ length: count }, (_, i) => prev[i] ?? { text: promptRef.current, on: true })
+    )
+  }, [count, varyOn, variants.length])
+
+  // How many runs Generate will actually fire: with per-run prompts it follows the ticked rows,
+  // otherwise the Runs box.
+  const varying = varyOn && count > 1
+  const genCount = varying ? variants.filter((v) => v.on && v.text.trim()).length : count
+  const [suggesting, setSuggesting] = useState(false)
+  const [suggestNote, setSuggestNote] = useState<string | null>(null)
+
+  // Grow a prompt box to its content instead of scrolling a 3-line window — with several rows
+  // on screen the whole point is reading them side by side, which you can't do through a slot.
+  const fitBox = (el: HTMLTextAreaElement | null): void => {
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, 240) + 'px'
+  }
+
+  // Ask the model for one prompt per run. It gets the artwork, not just the text: suggestions
+  // made blind don't fit the frame (see geminiVariants).
+  const suggestVariants = useCallback(async () => {
+    const sel = selection
+    const node = sel ? nodeById(sel.imgId) : null
+    if (!node || !promptText.trim() || suggesting) return
+    setSuggesting(true)
+    setSuggestNote(null)
+    try {
+      const r = await window.api.variants({ image: node.src, prompt: promptText, count })
+      if (r.error || !r.variants?.length) {
+        setSuggestNote(r.error || 'no suggestions came back')
+        return
+      }
+      // Fewer suggestions than runs is a legitimate answer — keep the extra rows on the original
+      // prompt rather than padding them with filler.
+      setVariants((prev) =>
+        Array.from({ length: count }, (_, i) => {
+          const v = r.variants?.[i]
+          return v ? { text: v.prompt, on: true } : { text: prev[i]?.text ?? promptText, on: false }
+        })
+      )
+      const short = r.variants.length < count ? `${r.variants.length} of ${count} runs. ` : ''
+      setSuggestNote((short + (r.note ?? '')).trim() || null)
+    } catch (e) {
+      setSuggestNote((e as Error).message || 'suggest failed')
+    } finally {
+      setSuggesting(false)
+    }
+  }, [selection, nodeById, promptText, count, suggesting])
 
   // ---- transforms (stable) ----
   const screenToWorld = useCallback((clientX: number, clientY: number) => {
@@ -829,7 +898,7 @@ export default function Canvas({
   // immediately, so the user can select + dispatch another job while this one runs.
   const runGeneration = useCallback(
     (params: {
-      perform: () => Promise<string>
+      perform: (i: number) => Promise<string>
       prompt: string
       action: 'edit' | 'extract'
       model: string
@@ -839,6 +908,9 @@ export default function Canvas({
       colW: number
       count?: number // override the Runs setting (e.g. Remove BG is always a single run)
       remember?: boolean // false ⇒ keep this prompt out of the recent-prompt history
+      // Per-run prompts, when the batch is varying. Recorded on each result node so you can
+      // always read back which wording produced which image — and re-run the one that won.
+      prompts?: string[]
     }) => {
       const N = clamp(params.count ?? count, 1, 10)
       const jobId = uid()
@@ -846,13 +918,20 @@ export default function Canvas({
       jobAborts.current.set(jobId, ac)
       pushHistory()
       const label = params.action === 'extract' ? 'Extracting' : N > 1 ? 'Variation' : 'Generating'
+      // With per-run prompts, caption each slot with its own wording rather than "Variation 3" —
+      // while a batch is still rendering you can already tell which placeholder is which idea.
+      const slotLabel = (i: number): string => {
+        const t = params.prompts?.[i]?.trim().replace(/\s+/g, ' ')
+        if (t) return t.length > 26 ? t.slice(0, 25) + '…' : t
+        return N > 1 ? `${label} ${i + 1}` : label
+      }
       // place the whole N-wide block clear of existing images + other in-flight slots
       const blockW = (N - 1) * params.colW + params.res.w
       const spot = placeFree(params.baseX, params.baseY, blockW, params.res.h)
       const slots: PendingSlot[] = Array.from({ length: N }, (_, i) => ({
         id: uid(),
         jobId,
-        label: N > 1 ? `${label} ${i + 1}` : label,
+        label: slotLabel(i),
         x: spot.x + i * params.colW,
         y: spot.y,
         w: params.res.w,
@@ -870,7 +949,7 @@ export default function Canvas({
             const i = next++
             if (i >= N) break
             try {
-              const image = await params.perform()
+              const image = await params.perform(i)
               if (ac.signal.aborted) break
               // land the result where its placeholder currently is (the user may have dragged it)
               const cur = pendingRef.current.find((s) => s.id === slots[i].id)
@@ -883,7 +962,8 @@ export default function Canvas({
                 h: params.res.h,
                 nW: params.res.nW,
                 nH: params.res.nH,
-                prompt: params.prompt || undefined,
+                prompt: params.prompts?.[i] || params.prompt || undefined,
+                name: params.prompts ? slotLabel(i) : undefined, // shows in the Layers panel
                 model: params.model,
                 createdAt: Date.now(),
                 transparent: params.res.transparent,
@@ -932,9 +1012,16 @@ export default function Canvas({
     const mdl = model
     const transparent = node.transparent
     const gap = Math.max(24, node.w * 0.05)
+    // Varying ⇒ one run per ticked row, each with its own wording. Unticked rows simply don't run,
+    // so the batch size follows the rows rather than the Runs box.
+    const rows = varyOn && count > 1 ? variants.filter((v) => v.on && v.text.trim()) : []
+    const prompts = rows.length ? rows.map((v) => v.text.trim()) : undefined
     runGeneration({
-      perform: () => imageEdit({ src, bbox, prompt, model: mdl, stroke: strokeReq, references: refs, transparent }),
+      perform: (i) =>
+        imageEdit({ src, bbox, prompt: prompts?.[i] ?? prompt, model: mdl, stroke: strokeReq, references: refs, transparent }),
       prompt,
+      prompts,
+      count: prompts?.length,
       action: 'edit',
       model: mdl,
       res: { w: node.w, h: node.h, nW: node.nW, nH: node.nH, transparent },
@@ -946,7 +1033,7 @@ export default function Canvas({
     clearSelection()
     setPromptText('')
     setErr(null)
-  }, [selection, promptText, model, references, nodeById, runGeneration, clearSelection])
+  }, [selection, promptText, model, references, nodeById, runGeneration, clearSelection, varyOn, count, variants])
 
   // Restyle: re-render the selected image in a built-in style guide's art direction. One click —
   // the guide supplies the prompt and its own reference art, so promptText may be empty (anything
@@ -1472,7 +1559,11 @@ export default function Canvas({
                   : 'Generate: describe the change. Extract: name the element (optional, e.g. “the gold ring”).'
               }
               value={promptText}
-              onChange={(e) => setPromptText(e.target.value)}
+              ref={fitBox}
+              onChange={(e) => {
+                fitBox(e.target)
+                setPromptText(e.target.value)
+              }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
                   e.preventDefault()
@@ -1626,6 +1717,70 @@ export default function Canvas({
                 </select>
               </label>
             </div>
+            {count > 1 ? (
+              <div className="vary">
+                <div className="vary-head">
+                  <span className="vary-label">Prompts</span>
+                  <div className="vary-switch">
+                    <button className={varyOn ? '' : 'on'} onClick={() => setVaryOn(false)} title="Every run gets the identical prompt — differences come from the model's own sampling">
+                      Same
+                    </button>
+                    <button className={varyOn ? 'on' : ''} onClick={() => setVaryOn(true)} title="Give each run its own prompt, so the batch explores different ideas">
+                      Vary
+                    </button>
+                  </div>
+                  {varyOn ? (
+                    <>
+                      <button
+                        className="vary-suggest"
+                        onClick={suggestVariants}
+                        disabled={suggesting || !promptText.trim()}
+                        title="Let the model write one prompt per run, from your prompt and this artwork"
+                      >
+                        {suggesting ? 'Thinking…' : '✨ Suggest'}
+                      </button>
+                      <button
+                        className="vary-reset"
+                        onClick={() => {
+                          setSuggestNote(null)
+                          setVariants(Array.from({ length: count }, () => ({ text: promptText, on: true })))
+                        }}
+                        title="Refill every row from the prompt box above"
+                      >
+                        Reset
+                      </button>
+                    </>
+                  ) : null}
+                </div>
+                {varyOn ? (
+                  <div className="vary-rows">
+                    {variants.map((v, i) => (
+                      <div className={'vary-row' + (v.on ? '' : ' off')} key={i}>
+                        <input
+                          type="checkbox"
+                          checked={v.on}
+                          title="Include this run"
+                          onChange={(e) =>
+                            setVariants((prev) => prev.map((r, k) => (k === i ? { ...r, on: e.target.checked } : r)))
+                          }
+                        />
+                        <textarea
+                          ref={fitBox}
+                          rows={1}
+                          value={v.text}
+                          placeholder={promptText || 'prompt for this run'}
+                          onChange={(e) => {
+                            fitBox(e.target)
+                            setVariants((prev) => prev.map((r, k) => (k === i ? { ...r, text: e.target.value } : r)))
+                          }}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {varyOn && suggestNote ? <div className="vary-note">{suggestNote}</div> : null}
+              </div>
+            ) : null}
             <div className="prompt-tip extract-hint">
               {activeGuide
                 ? `Restyle: re-renders the WHOLE image in ${activeMaterials.length === activeGuide.materials.length ? `the full “${activeGuide.name}” direction` : activeGuide.materials.filter((m) => activeMaterials.includes(m.id)).map((m) => m.name).join(' + ')} — reference art attached automatically. Runs ${count > 1 ? `${count} takes` : 'once'}; a reference can occasionally hijack a take, so generating a few and picking is normal.`
@@ -1657,8 +1812,12 @@ export default function Canvas({
                   {count > 1 ? `Restyle ${count}` : 'Restyle'}
                 </button>
               ) : (
-                <button className="btn primary" onClick={runEdit} disabled={!promptText.trim() && references.length === 0}>
-                  {count > 1 ? `Generate ${count}` : 'Generate'}
+                <button
+                  className="btn primary"
+                  onClick={runEdit}
+                  disabled={varying ? genCount === 0 : !promptText.trim() && references.length === 0}
+                >
+                  {genCount > 1 ? `Generate ${genCount}` : 'Generate'}
                 </button>
               )}
             </div>

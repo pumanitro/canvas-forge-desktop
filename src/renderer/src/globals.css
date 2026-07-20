@@ -202,6 +202,107 @@ button {
   color: var(--danger);
 }
 
+/* Per-run prompts (Same / Vary). Only rendered when Runs > 1. */
+.vary {
+  margin-top: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+.vary-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.vary-label {
+  color: var(--muted);
+  font-size: 12px;
+}
+.vary-switch {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.vary-switch button {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.vary-switch button.on {
+  background: var(--accent);
+  color: #fff;
+}
+.vary-reset {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 11px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.vary-reset:hover {
+  color: var(--accent-2);
+}
+.vary-suggest {
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--accent-2);
+  font-size: 11px;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+.vary-suggest:hover:not(:disabled) {
+  background: rgba(124, 92, 255, 0.16);
+}
+.vary-suggest:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.vary-note {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.vary-rows {
+  margin-top: 6px;
+  max-height: 320px; /* keep the popover usable at Runs 10 — the rows scroll, the actions don't */
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.vary-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+.vary-row textarea {
+  flex: 1;
+  resize: vertical;
+  overflow-y: auto; /* JS grows it to fit, up to a cap — past that this takes over */
+  background: #000;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 7px;
+  min-width: 0;
+}
+.vary-row textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.vary-row.off textarea {
+  opacity: 0.4; /* unticked rows stay readable but clearly won't run */
+}
+
 /* Drag to reorder: the carried card lifts and follows the cursor, the rest slide one slot
    out of its way, and a dashed slot shows exactly where it lands. Everything moves by
    transform — no reflow — so the layout snapshot the drop is measured against stays true. */

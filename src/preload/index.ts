@@ -4,6 +4,8 @@ import { electronAPI } from '@electron-toolkit/preload'
 const api = {
   gemini: (opts: { prompt: string; images: string[]; model: string; aspectRatio?: string }) =>
     ipcRenderer.invoke('gemini:generate', opts) as Promise<{ image?: string; error?: string }>,
+  variants: (opts: { image: string; prompt: string; count: number }) =>
+    ipcRenderer.invoke('gemini:variants', opts) as Promise<{ variants?: { label: string; prompt: string }[]; note?: string; error?: string }>,
   loadProjects: () => ipcRenderer.invoke('projects:load'),
   saveProject: (p: unknown) => ipcRenderer.invoke('projects:save', p),
   deleteProject: (id: string) => ipcRenderer.invoke('projects:delete', id),

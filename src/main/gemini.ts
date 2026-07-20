@@ -112,6 +112,92 @@ export async function geminiDetect(opts: {
   throw new Error(lastErr || 'detection failed')
 }
 
+// Propose N alternative wordings of one edit instruction, for a varied batch.
+//
+// The image goes with the request on purpose: asked blind, a model invents variations that
+// read well but don't fit the artwork — placements that collide with existing UI, colours that
+// aren't in the palette. Seeing the frame is what makes the suggestions usable.
+//
+// The brief also lets it return FEWER than asked. An instruction with no dimension worth
+// varying ("remove the drop shadow") has no six distinct readings, and a model forced to
+// produce six will pad the list with near-duplicates or quietly drift off the request.
+export async function geminiVariants(opts: {
+  image: string
+  prompt: string
+  count: number
+  model?: string
+}): Promise<{ variants: { label: string; prompt: string }[]; note?: string }> {
+  const keys = loadKeys()
+  if (!keys.length) throw new Error('No Gemini API key set. Add one in Settings (or a .env with GEMINI_API_KEY).')
+  const model = opts.model || 'gemini-2.5-flash'
+  const brief = [
+    'An artist is editing the attached artwork and wrote this instruction:',
+    `"""${opts.prompt.trim()}"""`,
+    '',
+    `Write up to ${opts.count} alternative versions of that instruction, to run as a batch the artist picks from.`,
+    'EVERY version must achieve the SAME thing the artist asked for. Vary only HOW it is done —',
+    'the approach, placement, treatment or emphasis. Never change WHAT is being asked for, and',
+    'never add a second unrelated change.',
+    'Ground each one in what is actually visible in the attached image: real elements, real',
+    'placements, the palette that is already there. Never propose something that would overlap or',
+    'obscure existing artwork or UI.',
+    'Write each prompt as a complete, standalone instruction in the artist\'s own plain voice —',
+    'it is sent to an image model verbatim, so it must stand on its own without the others.',
+    '',
+    'Each entry has "label" (2-4 words naming what makes it distinct) and "prompt" (the full instruction).',
+    `If the instruction has no real dimension worth varying, return FEWER than ${opts.count} and say why in "note".`,
+    '',
+    'Respond with ONLY minified JSON: {"variants":[{"label":"...","prompt":"..."}],"note":"..."}'
+  ].join('\n')
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`
+  const body = JSON.stringify({
+    contents: [{ parts: [{ text: brief }, { inline_data: dataUrlToInline(opts.image) }] }],
+    // Warm enough that the alternatives actually diverge — unlike detection, spread is the point.
+    generationConfig: { temperature: 1, responseMimeType: 'application/json' }
+  })
+
+  let lastErr = ''
+  for (let i = 0; i < keys.length; i++) {
+    const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': keys[i] }, body })
+    if (res.ok) {
+      const dataJson = await res.json()
+      const parts = dataJson?.candidates?.[0]?.content?.parts ?? []
+      const text = parts.map((p: { text?: string }) => p.text).filter(Boolean).join('')
+      if (!text) throw new Error('no suggestions returned')
+      let parsed: { variants?: unknown; note?: unknown }
+      try {
+        parsed = JSON.parse(text)
+      } catch {
+        const m = text.match(/\{[\s\S]*\}/)
+        if (!m) throw new Error('could not read the suggestions')
+        parsed = JSON.parse(m[0])
+      }
+      const raw = Array.isArray(parsed.variants) ? parsed.variants : []
+      const variants = raw
+        .map((v) => v as { label?: unknown; prompt?: unknown })
+        .filter((v) => typeof v.prompt === 'string' && (v.prompt as string).trim())
+        .slice(0, opts.count)
+        .map((v) => ({ label: typeof v.label === 'string' ? v.label : '', prompt: (v.prompt as string).trim() }))
+      if (!variants.length) throw new Error('no usable suggestions returned')
+      return { variants, note: typeof parsed.note === 'string' ? parsed.note : undefined }
+    }
+    const t = (await res.text()).slice(0, 700)
+    // Surface Google's own sentence, not the raw JSON envelope — this lands in a one-line note
+    // under the rows, where a pasted error blob is unreadable.
+    let msg = t
+    try {
+      msg = (JSON.parse(t) as { error?: { message?: string } })?.error?.message || t
+    } catch {
+      /* not JSON — keep the body */
+    }
+    lastErr = `Suggest failed (${res.status}): ${msg.trim()}`
+    const quota = res.status === 429 || /quota|RESOURCE_EXHAUSTED|prepayment/i.test(t)
+    if (quota && i < keys.length - 1) continue
+    throw new Error(lastErr)
+  }
+  throw new Error(lastErr || 'suggestions failed')
+}
+
 // images: array of data URLs. Returns a PNG data URL, or throws.
 // aspectRatio (e.g. '9:16') pins the output shape at the API level. Prose alone does NOT hold
 // it: with several reference images attached, the model reshapes its output after them and

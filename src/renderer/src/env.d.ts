@@ -12,6 +12,11 @@ declare global {
   interface Window {
     api: {
       gemini: (opts: { prompt: string; images: string[]; model: string; aspectRatio?: string }) => Promise<{ image?: string; error?: string }>
+      variants: (opts: { image: string; prompt: string; count: number }) => Promise<{
+        variants?: { label: string; prompt: string }[]
+        note?: string
+        error?: string
+      }>
       loadProjects: () => Promise<Project[]>
       saveProject: (p: Project) => Promise<unknown>
       deleteProject: (id: string) => Promise<unknown>

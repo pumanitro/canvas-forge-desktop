@@ -3,7 +3,7 @@ import { join } from 'path'
 import { writeFileSync, readFileSync } from 'fs'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
-import { geminiGenerate, geminiDetect, hasKey } from './gemini'
+import { geminiGenerate, geminiDetect, geminiVariants, hasKey } from './gemini'
 import {
   loadProjects,
   saveProject,
@@ -147,6 +147,15 @@ function registerIpc(): void {
       return await geminiDetect(opts)
     } catch (err) {
       return { error: err instanceof Error ? err.message : 'detect failed' }
+    }
+  })
+
+  // --- per-run prompt suggestions for a varied batch ---
+  ipcMain.handle('gemini:variants', async (_e, opts: { image: string; prompt: string; count: number }) => {
+    try {
+      return await geminiVariants(opts)
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : 'suggest failed' }
     }
   })
 

@@ -337,21 +337,56 @@ export async function imageRestyle(p: {
   const H = img.naturalHeight
   const refs = p.references.slice(0, 3) // base + 3 refs = the 4-image cap
 
-  // Letterbox refs to the artwork's aspect — an unpadded ref reshapes the output (see padToAspect).
-  const paddedRefs = await Promise.all(refs.map((r) => padToAspect(r, W, H)))
-  const genUrl = await gemini(p.prompt, p.model, [p.src, ...paddedRefs], nearestAspect(W, H))
+  // The image API only emits a FIXED set of aspect ratios (see ASPECTS), and we must lock one or
+  // several attached refs will reshape the output's orientation. For art whose true aspect isn't
+  // in that set — a skinny HUD bar snaps to 21:9, the widest enum, but is really ~6:1 — a raw base
+  // forces the model to IMPROVISE the missing aspect as empty padding: the artwork comes back as a
+  // small island of content floating in dead space, which no post-fit on our side can recover.
+  //
+  // So we pre-letterbox the BASE to that same enum ourselves, on the neutral ref padding. Now the
+  // model's output frame MATCHES its input frame, so it has no reason to add or move padding — it
+  // just restyles in place — and we know EXACTLY where the artwork sits (the band we padded). After
+  // generation we crop that band straight back out to W×H: no drift, no guessing at model padding.
+  const ar = nearestAspect(W, H)
+  const [arW, arH] = ar.split(':').map(Number)
+  const arRatio = arW / arH
+  let padW = W
+  let padH = H
+  if (W / H > arRatio) padH = Math.round(W / arRatio) // artwork wider than the enum → pad top/bottom
+  else padW = Math.round(H * arRatio) //                     artwork taller than the enum → pad left/right
+  const offX = Math.round((padW - W) / 2)
+  const offY = Math.round((padH - H) / 2)
+  const base = makeCanvas(padW, padH)
+  base.ctx.fillStyle = '#17181d' // same neutral as padToAspect, so the pad edge doesn't read as art
+  base.ctx.fillRect(0, 0, padW, padH)
+  base.ctx.drawImage(img, offX, offY, W, H)
+
+  // Letterbox refs to the SAME (padded) aspect the output will take — an unpadded ref reshapes it.
+  const paddedRefs = await Promise.all(refs.map((r) => padToAspect(r, padW, padH)))
+  const genUrl = await gemini(
+    p.prompt,
+    p.model,
+    [base.cv.toDataURL('image/png'), ...paddedRefs],
+    ar
+  )
   const gen = await loadImg(genUrl)
 
-  // Contain-fit into the original resolution: preserve aspect, never stretch. The aspect lock
-  // makes a mismatch unlikely, but a snapped enum is never an EXACT match for arbitrary pixel
-  // dimensions, so the letterbox is what keeps the result from being squashed.
-  const gw = gen.naturalWidth || W
-  const gh = gen.naturalHeight || H
-  const s = Math.min(W / gw, H / gh)
-  const dw = Math.round(gw * s)
-  const dh = Math.round(gh * s)
+  // Crop the artwork band back out — the same fraction of the frame we padded it into — and scale
+  // it to the exact original resolution. Full frame edge-to-edge, no empty margins.
+  const gw = gen.naturalWidth || padW
+  const gh = gen.naturalHeight || padH
   const out = makeCanvas(W, H)
-  out.ctx.drawImage(gen, Math.round((W - dw) / 2), Math.round((H - dh) / 2), dw, dh)
+  out.ctx.drawImage(
+    gen,
+    (offX / padW) * gw,
+    (offY / padH) * gh,
+    (W / padW) * gw,
+    (H / padH) * gh,
+    0,
+    0,
+    W,
+    H
+  )
   return out.cv.toDataURL('image/png')
 }
 
