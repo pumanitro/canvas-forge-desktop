@@ -390,6 +390,209 @@ button {
   padding: 1px 5px;
   font-size: 11px;
 }
+/* ---------- Agent access (MCP): sidebar chip + info panel ---------- */
+/* The chip is a permanent, clickable answer to "how do I point an agent at this?" — and it
+   reports whether one is actually attached, which the port being open does not tell you. */
+.mcp-chip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 10px 16px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.mcp-chip:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+.mcp-chip-label {
+  font-weight: 600;
+}
+.mcp-chip-state {
+  margin-left: auto;
+  opacity: 0.75;
+}
+.mcp-chip-i {
+  opacity: 0.5;
+}
+.mcp-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #555a66;
+  flex: 0 0 auto;
+}
+.mcp-chip.live .mcp-dot,
+.mcp-modal .mcp-dot.on {
+  background: #c8a44a;
+}
+.mcp-chip.attached .mcp-dot {
+  background: #4ec27f;
+  box-shadow: 0 0 0 3px rgb(78 194 127 / 18%);
+}
+
+.mcp-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: rgb(0 0 0 / 55%);
+  backdrop-filter: blur(2px);
+}
+.mcp-modal {
+  width: min(680px, 100%);
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 24px 60px rgb(0 0 0 / 55%);
+  overflow: hidden;
+}
+.mcp-modal header {
+  display: flex;
+  align-items: center;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.mcp-modal h2 {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.mcp-x {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+.mcp-x:hover {
+  color: var(--text);
+}
+.mcp-body {
+  padding: 16px 18px 20px;
+  overflow-y: auto;
+  font-size: 12.5px;
+  line-height: 1.65;
+}
+.mcp-body h3 {
+  margin: 22px 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+.mcp-lede {
+  margin: 0 0 14px;
+  color: var(--text);
+}
+.mcp-status {
+  padding: 11px 13px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.mcp-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.mcp-row + .mcp-row {
+  margin-top: 5px;
+}
+.mcp-k {
+  flex: 0 0 74px;
+  color: var(--muted);
+}
+.mcp-url {
+  user-select: text;
+  word-break: break-all;
+}
+.mcp-client + .mcp-client {
+  margin-left: 8px;
+}
+.mcp-dim {
+  color: var(--muted);
+}
+.mcp-bad {
+  color: #e2856b;
+}
+.mcp-steps {
+  margin: 0;
+  padding-left: 20px;
+}
+.mcp-steps > li {
+  margin-bottom: 12px;
+}
+/* Commands and config are for copying, so they get a real affordance rather than bare <code>. */
+.mcp-code {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 6px 0;
+  padding: 8px 10px;
+  background: #0b0c10;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.mcp-code code,
+.mcp-code pre {
+  flex: 1;
+  margin: 0;
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  color: #d8dae0;
+}
+.mcp-copy {
+  flex: 0 0 auto;
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.mcp-copy:hover {
+  color: var(--text);
+}
+.mcp-copy.done {
+  color: #4ec27f;
+  border-color: #33613f;
+}
+.mcp-caps {
+  margin: 0;
+  padding-left: 20px;
+}
+.mcp-note {
+  margin: 16px 0 0;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  border-left: 2px solid #c8a44a;
+  border-radius: 0 6px 6px 0;
+  color: var(--muted);
+}
 
 /* ------------ Canvas area ------------ */
 .stage {

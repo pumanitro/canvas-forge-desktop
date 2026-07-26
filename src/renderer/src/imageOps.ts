@@ -29,6 +29,30 @@ async function gemini(prompt: string, model: string, images: string[], aspectRat
   return r.image
 }
 
+// Crop and/or shrink an image to a PNG data URL. Used by the MCP bridge to hand an agent a
+// look at the canvas without shipping a 4 MB base64 blob into its context for every glance.
+export async function renderImage(
+  src: string,
+  opts: { region?: Box | null; maxSize?: number } = {}
+): Promise<{ dataUrl: string; w: number; h: number; srcW: number; srcH: number }> {
+  const img = await loadImg(src)
+  const srcW = img.naturalWidth
+  const srcH = img.naturalHeight
+  const r = opts.region
+  const cx = r ? clamp(Math.round(r.x), 0, srcW - 1) : 0
+  const cy = r ? clamp(Math.round(r.y), 0, srcH - 1) : 0
+  const cw = r ? clamp(Math.round(r.w), 1, srcW - cx) : srcW
+  const ch = r ? clamp(Math.round(r.h), 1, srcH - cy) : srcH
+  const max = opts.maxSize && opts.maxSize > 0 ? opts.maxSize : Infinity
+  const s = Math.min(1, max / Math.max(cw, ch))
+  const w = Math.max(1, Math.round(cw * s))
+  const h = Math.max(1, Math.round(ch * s))
+  const { cv, ctx } = makeCanvas(w, h)
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(img, cx, cy, cw, ch, 0, 0, w, h)
+  return { dataUrl: cv.toDataURL('image/png'), w, h, srcW, srcH }
+}
+
 // The only output shapes the image API accepts. Anything else is rejected, so we snap.
 const ASPECTS: [string, number][] = [
   ['1:1', 1], ['2:3', 2 / 3], ['3:2', 3 / 2], ['3:4', 3 / 4], ['4:3', 4 / 3],

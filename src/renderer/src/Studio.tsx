@@ -1,8 +1,10 @@
 
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import Canvas from './Canvas'
+import McpPanel from './McpPanel'
 import type { ImageNode, Project } from './types'
 import { loadProjects, removeProject, saveProject, saveProjectOrder } from './store'
+import { awaitProject, registerBridge } from './mcpBridge'
 import { uid } from './util'
 
 const THUMB_W = 186
@@ -110,6 +112,69 @@ export default function Studio() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [flashToast])
+
+  // ---- MCP: the project-level tools (the canvas ones live in Canvas.tsx) ----
+  // Registered here because only Studio knows the project list and can switch between them.
+  // Sidebar chip state. Polled slowly (the panel itself polls fast when open) so the chip can
+  // say whether an agent is actually attached rather than only whether the port is open.
+  const [mcpChip, setMcpChip] = useState<{ live: boolean; clients: number } | null>(null)
+  const [mcpOpen, setMcpOpen] = useState(false)
+  useEffect(() => {
+    let alive = true
+    const tick = (): void => {
+      window.api
+        .mcpInfo?.()
+        .then((i) => {
+          if (alive) setMcpChip(i ? { live: !!i.port, clients: i.clients?.length ?? 0 } : null)
+        })
+        .catch(() => {})
+    }
+    tick()
+    const t = window.setInterval(tick, 8000)
+    return () => {
+      alive = false
+      window.clearInterval(t)
+    }
+  }, [])
+  useEffect(() =>
+    registerBridge({
+      list_projects: () => ({
+        json: {
+          openProjectId: currentIdRef.current,
+          projects: projectsRef.current.map((p) => ({
+            id: p.id,
+            name: p.name,
+            images: p.images.length,
+            open: p.id === currentIdRef.current,
+            updatedAt: new Date(p.updatedAt).toISOString()
+          }))
+        }
+      }),
+      open_project: async (params) => {
+        const list = projectsRef.current
+        let target = typeof params.projectId === 'string' ? list.find((p) => p.id === params.projectId) : undefined
+        if (!target && typeof params.name === 'string') {
+          const q = params.name.trim().toLowerCase()
+          const hits = list.filter((p) => p.name.trim().toLowerCase() === q)
+          if (hits.length > 1) throw new Error(`"${params.name}" matches ${hits.length} projects — use projectId.`)
+          target = hits[0]
+        }
+        if (!target) {
+          throw new Error(`No such project. Available: ${list.map((p) => `${p.name} (${p.id})`).join(', ')}`)
+        }
+        setCurrentId(target.id)
+        // Don't answer until that project's canvas is the one serving tool calls, or the caller's
+        // next get_state would still describe the project we just left.
+        const live = await awaitProject(target.id)
+        return {
+          text:
+            `Opened "${target.name}" — ${target.images.length} image(s) on the canvas.` +
+            (live ? '' : ' (the canvas is still mounting — re-check with get_state)'),
+          json: { id: target.id, name: target.name, images: target.images.length }
+        }
+      }
+    })
+  , [])
 
   const handleImagesChange = useCallback(
     (images: ImageNode[]) => {
@@ -424,12 +489,31 @@ export default function Studio() {
           <br />
           drag a project card to reorder the list
         </div>
+
+        {/* Always reachable: how to point an AI agent at this canvas, plus whether one is. */}
+        <button
+          className={'mcp-chip' + (mcpChip?.clients ? ' attached' : mcpChip?.live ? ' live' : '')}
+          onClick={() => setMcpOpen(true)}
+          title="How to connect an AI agent to this canvas (MCP)"
+        >
+          <span className="mcp-dot" />
+          <span className="mcp-chip-label">Agent access</span>
+          <span className="mcp-chip-state">
+            {mcpChip?.clients
+              ? `${mcpChip.clients} connected`
+              : mcpChip?.live
+                ? 'ready'
+                : 'off'}
+          </span>
+          <span className="mcp-chip-i">ⓘ</span>
+        </button>
       </aside>
 
       <main className="stage">
         {ready && current ? <Canvas key={current.id} project={current} onImagesChange={handleImagesChange} /> : null}
         {toast ? <div className="toast">{toast}</div> : null}
       </main>
+      {mcpOpen ? <McpPanel onClose={() => setMcpOpen(false)} /> : null}
     </div>
   )
 }

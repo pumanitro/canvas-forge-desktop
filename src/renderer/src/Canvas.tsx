@@ -3,8 +3,19 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { ImageNode, Project } from './types'
 import { clamp, uid } from './util'
 import { addPrompt, loadPrompts } from './store'
-import { imageEdit, imageExtract, imageExtractBackground, imageRemoveBg, imageRestyle } from './imageOps'
-import { STYLE_GUIDES, buildRestylePrompt, refsFor } from './styleguides'
+import { imageEdit, imageExtract, imageExtractBackground, imageRemoveBg, imageRestyle, renderImage } from './imageOps'
+import {
+  describeNode,
+  finishJob,
+  getJob,
+  registerBridge,
+  setActiveProject,
+  startJob,
+  toDataUrl,
+  type BridgeResult,
+  type JobRecord
+} from './mcpBridge'
+import { STYLE_GUIDES, buildRestylePrompt, refsFor, type StyleGuide } from './styleguides'
 import { ensureMatteModel, matteModelReady, onMatteProgress } from './matte'
 
 type View = { x: number; y: number; zoom: number }
@@ -91,11 +102,15 @@ export default function Canvas({
   }, [tool])
 
   // multi-selection of image nodes (for move / delete as a group)
-  const [selectedIds, setSelectedIds] = useState<string[]>([])
+  const [selectedIds, setSelectedIdsState] = useState<string[]>([])
   const selectedIdsRef = useRef<string[]>([])
-  useEffect(() => {
-    selectedIdsRef.current = selectedIds
-  }, [selectedIds])
+  // Sync setter, like setBandSync/setMarq below. The ref is the live mirror that drag handling
+  // and the MCP bridge read, and an incoming tool call can land between a set and React's commit
+  // — so the ref has to move in the same tick, not one render later.
+  const setSelectedIds = useCallback((ids: string[]) => {
+    selectedIdsRef.current = ids
+    setSelectedIdsState(ids)
+  }, [])
   // close the prompt-details popover whenever the selection changes
   useEffect(() => {
     setDetailOpen(false)
@@ -138,7 +153,12 @@ export default function Canvas({
   const marqueeRef = useRef<Sel | null>(null)
   const [stroke, setStroke] = useState<Pt[] | null>(null)
   const strokeRef = useRef<Pt[] | null>(null)
-  const [selection, setSelection] = useState<Sel | null>(null)
+  const [selection, setSelectionState] = useState<Sel | null>(null)
+  const selectionRef = useRef<Sel | null>(null)
+  const setSelection = useCallback((s: Sel | null) => {
+    selectionRef.current = s
+    setSelectionState(s)
+  }, [])
   const [promptText, setPromptText] = useState('')
   const [history, setHistory] = useState<string[]>([])
   const [model, setModel] = useState('gemini-3-pro-image')
@@ -265,7 +285,7 @@ export default function Canvas({
     setRefPick(false)
     setRefMarq(null)
     setVariants([]) // next selection refills the rows from its own prompt
-  }, [setMarq, setStrokePts, setRefMarq])
+  }, [setSelection, setMarq, setStrokePts, setRefMarq])
 
   // Keep one row per run. Existing rows survive a Runs change (your edits aren't thrown away);
   // new rows are seeded with whatever is in the main prompt box. Returning `prev` unchanged when
@@ -354,40 +374,50 @@ export default function Canvas({
   }, [])
 
   // ---- add image at NATURAL resolution (no quality loss); frame the first one ----
+  // Resolves with the node once the image has decoded — the MCP bridge needs the id (and
+  // the real pixel size) to report back, and a caller that doesn't care just ignores it.
   const addImage = useCallback(
-    (src: string, atClient?: { x: number; y: number }) => {
-      const img = new window.Image()
-      img.onload = () => {
-        const nW = img.naturalWidth
-        const nH = img.naturalHeight
-        const el = viewportRef.current
-        if (!el || !nW || !nH) return
-        const r = el.getBoundingClientRect()
-        const v = viewRef.current
-        const wasEmpty = nodesRef.current.length === 0
-        const w = nW
-        const h = nH
-        const sx = atClient ? atClient.x - r.left : r.width / 2
-        const sy = atClient ? atClient.y - r.top : r.height / 2
-        const wx = (sx - v.x) / v.zoom
-        const wy = (sy - v.y) / v.zoom
-        const node: ImageNode = { id: uid(), src, x: wx - w / 2, y: wy - h / 2, w, h, nW, nH }
-        pushHistory()
-        apply([...nodesRef.current, node])
-        setSelectedIds([node.id])
-        if (wasEmpty) {
-          const z = clamp(Math.min((r.width - 80) / w, (r.height - 80) / h, 1), MIN_ZOOM, MAX_ZOOM)
-          setView({ x: r.width / 2 - (node.x + w / 2) * z, y: r.height / 2 - (node.y + h / 2) * z, zoom: z })
+    (
+      src: string,
+      atClient?: { x: number; y: number },
+      opts?: { world?: Pt; name?: string; select?: boolean }
+    ): Promise<ImageNode> =>
+      new Promise((resolve, reject) => {
+        const img = new window.Image()
+        img.onload = () => {
+          const nW = img.naturalWidth
+          const nH = img.naturalHeight
+          const el = viewportRef.current
+          if (!el || !nW || !nH) return reject(new Error('Could not decode that image.'))
+          const r = el.getBoundingClientRect()
+          const v = viewRef.current
+          const wasEmpty = nodesRef.current.length === 0
+          const w = nW
+          const h = nH
+          const sx = atClient ? atClient.x - r.left : r.width / 2
+          const sy = atClient ? atClient.y - r.top : r.height / 2
+          // opts.world is an explicit TOP-LEFT; the cursor/viewport paths centre on a point.
+          const x = opts?.world ? opts.world.x : (sx - v.x) / v.zoom - w / 2
+          const y = opts?.world ? opts.world.y : (sy - v.y) / v.zoom - h / 2
+          const node: ImageNode = { id: uid(), src, x, y, w, h, nW, nH, name: opts?.name }
+          pushHistory()
+          apply([...nodesRef.current, node])
+          if (opts?.select !== false) setSelectedIds([node.id])
+          if (wasEmpty) {
+            const z = clamp(Math.min((r.width - 80) / w, (r.height - 80) / h, 1), MIN_ZOOM, MAX_ZOOM)
+            setView({ x: r.width / 2 - (node.x + w / 2) * z, y: r.height / 2 - (node.y + h / 2) * z, zoom: z })
+          }
+          resolve(node)
         }
-      }
-      img.src = src
-    },
-    [apply, pushHistory]
+        img.onerror = () => reject(new Error('Could not decode that image.'))
+        img.src = src
+      }),
+    [apply, pushHistory, setSelectedIds]
   )
   const fileToImage = useCallback(
     (file: File, atClient?: { x: number; y: number }) => {
       const reader = new FileReader()
-      reader.onload = () => addImage(String(reader.result), atClient)
+      reader.onload = () => void addImage(String(reader.result), atClient).catch(() => {})
       reader.readAsDataURL(file)
     },
     [addImage]
@@ -418,7 +448,7 @@ export default function Canvas({
       setSelectedIds(ids)
       setRevealIds((r) => [...r, ...ids])
     },
-    [apply, pushHistory]
+    [apply, pushHistory, setSelectedIds]
   )
 
   // ---- paste ----
@@ -569,7 +599,7 @@ export default function Canvas({
       window.removeEventListener('keydown', onKeyDown)
       window.removeEventListener('keyup', onKeyUp)
     }
-  }, [undo, pushHistory, apply, selectedIds, clearSelection, setBandSync, pasteNodes])
+  }, [undo, pushHistory, apply, selectedIds, clearSelection, setBandSync, pasteNodes, setSelectedIds, setRefMarq])
 
   // ---- wheel ----
   useEffect(() => {
@@ -760,7 +790,7 @@ export default function Canvas({
       window.removeEventListener('pointerup', onUp)
       window.removeEventListener('pointercancel', onUp)
     }
-  }, [screenToWorld, clampToNode, pushHistory, updateNode, apply, setMarq, setStrokePts, setBandSync, setRefMarq, addReferenceFromRegion])
+  }, [screenToWorld, clampToNode, pushHistory, updateNode, apply, setMarq, setStrokePts, setBandSync, setRefMarq, addReferenceFromRegion, setSelectedIds, setSelection])
 
   // ---- pointer down ----
   const beginDrag = (e: React.PointerEvent, drag: Drag) => {
@@ -911,9 +941,13 @@ export default function Canvas({
       // Per-run prompts, when the batch is varying. Recorded on each result node so you can
       // always read back which wording produced which image — and re-run the one that won.
       prompts?: string[]
+      // MCP only: caller-supplied job id + a settle callback, so an agent can await a job
+      // that the UI itself deliberately never blocks on.
+      jobId?: string
+      onDone?: (r: { ids: string[]; errors: string[]; aborted: boolean }) => void
     }) => {
       const N = clamp(params.count ?? count, 1, 10)
-      const jobId = uid()
+      const jobId = params.jobId ?? uid()
       const ac = new AbortController()
       jobAborts.current.set(jobId, ac)
       pushHistory()
@@ -981,6 +1015,9 @@ export default function Canvas({
         await Promise.all(Array.from({ length: Math.min(4, N) }, () => worker()))
         jobAborts.current.delete(jobId)
         updatePending((prev) => prev.filter((s) => s.jobId !== jobId)) // sweep any stragglers
+        // Settle the agent's promise BEFORE the abort bail-out, or a cancelled job would
+        // leave an MCP call hanging until its timeout.
+        params.onDone?.({ ids: newIds, errors, aborted: ac.signal.aborted })
         if (ac.signal.aborted) return
         if (newIds.length > 0) {
           if (params.prompt.trim() && params.remember !== false) addPrompt(params.prompt).then(setHistory)
@@ -994,46 +1031,80 @@ export default function Canvas({
     [count, pushHistory, apply, placeFree, updatePending]
   )
 
+  // The Generate pipeline itself, with every input passed in rather than read from UI state.
+  // The button below and the MCP `generate` tool both come through here, so an agent gets
+  // byte-for-byte the same treatment — marker box, references, tone lock, placement — as a click.
+  const generateOn = useCallback(
+    (p: {
+      node: ImageNode
+      sel: Sel
+      prompt: string
+      prompts?: string[]
+      model: string
+      references: string[]
+      count?: number
+      jobId?: string
+      onDone?: (r: { ids: string[]; errors: string[]; aborted: boolean }) => void
+    }) => {
+      const { node, sel } = p
+      const rx = node.nW / node.w
+      const ry = node.nH / node.h
+      const bbox = { x: (sel.x - node.x) * rx, y: (sel.y - node.y) * ry, w: sel.w * rx, h: sel.h * ry }
+      const strokeReq = sel.stroke
+        ? { points: sel.stroke.map((q) => ({ x: (q.x - node.x) * rx, y: (q.y - node.y) * ry })), radius: (sel.brush ?? 0) * rx }
+        : undefined
+      const src = node.src
+      const transparent = node.transparent
+      const gap = Math.max(24, node.w * 0.05)
+      runGeneration({
+        perform: (i) =>
+          imageEdit({
+            src,
+            bbox,
+            prompt: p.prompts?.[i] ?? p.prompt,
+            model: p.model,
+            stroke: strokeReq,
+            references: p.references,
+            transparent,
+          }),
+        prompt: p.prompt,
+        prompts: p.prompts,
+        count: p.prompts?.length ?? p.count,
+        action: 'edit',
+        model: p.model,
+        res: { w: node.w, h: node.h, nW: node.nW, nH: node.nH, transparent },
+        baseX: node.x + node.w + gap,
+        baseY: node.y,
+        colW: node.w + gap,
+        jobId: p.jobId,
+        onDone: p.onDone,
+      })
+    },
+    [runGeneration]
+  )
+
   // Generate: regenerate the selected region (1..N variations) to the right.
   const runEdit = useCallback(() => {
     const sel = selection
     if (!sel || (!promptText.trim() && references.length === 0)) return
     const node = nodeById(sel.imgId)
     if (!node) return
-    const rx = node.nW / node.w
-    const ry = node.nH / node.h
-    const bbox = { x: (sel.x - node.x) * rx, y: (sel.y - node.y) * ry, w: sel.w * rx, h: sel.h * ry }
-    const strokeReq = sel.stroke
-      ? { points: sel.stroke.map((p) => ({ x: (p.x - node.x) * rx, y: (p.y - node.y) * ry })), radius: (sel.brush ?? 0) * rx }
-      : undefined
-    const src = node.src
-    const refs = references.map((r) => r.src)
-    const prompt = promptText
-    const mdl = model
-    const transparent = node.transparent
-    const gap = Math.max(24, node.w * 0.05)
     // Varying ⇒ one run per ticked row, each with its own wording. Unticked rows simply don't run,
     // so the batch size follows the rows rather than the Runs box.
     const rows = varyOn && count > 1 ? variants.filter((v) => v.on && v.text.trim()) : []
-    const prompts = rows.length ? rows.map((v) => v.text.trim()) : undefined
-    runGeneration({
-      perform: (i) =>
-        imageEdit({ src, bbox, prompt: prompts?.[i] ?? prompt, model: mdl, stroke: strokeReq, references: refs, transparent }),
-      prompt,
-      prompts,
-      count: prompts?.length,
-      action: 'edit',
-      model: mdl,
-      res: { w: node.w, h: node.h, nW: node.nW, nH: node.nH, transparent },
-      baseX: node.x + node.w + gap,
-      baseY: node.y,
-      colW: node.w + gap,
+    generateOn({
+      node,
+      sel,
+      prompt: promptText,
+      prompts: rows.length ? rows.map((v) => v.text.trim()) : undefined,
+      model,
+      references: references.map((r) => r.src),
     })
     // detach: close the popover + clear selection so another region can be started now
     clearSelection()
     setPromptText('')
     setErr(null)
-  }, [selection, promptText, model, references, nodeById, runGeneration, clearSelection, varyOn, count, variants])
+  }, [selection, promptText, model, references, nodeById, generateOn, clearSelection, varyOn, count, variants])
 
   // Restyle: re-render the selected image in a built-in style guide's art direction. One click —
   // the guide supplies the prompt and its own reference art, so promptText may be empty (anything
@@ -1041,49 +1112,78 @@ export default function Canvas({
   //
   // Restyle always works on the WHOLE node, not the marquee: a style guide re-renders the artwork
   // edge-to-edge, and a part-restyled image would just seam. So we ignore any sub-region.
+  const restyleOn = useCallback(
+    (p: {
+      node: ImageNode
+      guide: StyleGuide
+      materials: string[]
+      extra: string
+      model: string
+      count?: number
+      jobId?: string
+      onDone?: (r: { ids: string[]; errors: string[]; aborted: boolean }) => void
+    }) => {
+      const { node } = p
+      const mats = p.materials.length ? p.materials : p.guide.materials.map((m) => m.id)
+      const prompt = buildRestylePrompt(p.guide, mats, p.extra)
+      const src = node.src
+      const refs = refsFor(p.guide, mats).map((r) => r.src)
+      const gap = Math.max(24, node.w * 0.05)
+      runGeneration({
+        perform: () => imageRestyle({ src, prompt, model: p.model, references: refs }),
+        prompt,
+        action: 'edit',
+        model: p.model,
+        count: p.count,
+        // Restyle returns an OPAQUE image: drop any transparent flag the source carried, or the
+        // canvas would keep rendering it with the checkerboard treatment.
+        res: { w: node.w, h: node.h, nW: node.nW, nH: node.nH, transparent: false },
+        baseX: node.x + node.w + gap,
+        baseY: node.y,
+        colW: node.w + gap,
+        // The built prompt is ~1k of boilerplate — keep it out of the recent-prompt chips.
+        remember: false,
+        jobId: p.jobId,
+        onDone: p.onDone
+      })
+    },
+    [runGeneration]
+  )
+
   const runRestyle = useCallback(() => {
     const sel = selection
     const guide = STYLE_GUIDES.find((g) => g.id === guideId)
     if (!sel || !guide) return
     const node = nodeById(sel.imgId)
     if (!node) return
-    const mats = materials.length ? materials : guide.materials.map((m) => m.id)
-    const prompt = buildRestylePrompt(guide, mats, promptText)
-    const src = node.src
-    const mdl = model
-    const refs = refsFor(guide, mats).map((r) => r.src)
-    const gap = Math.max(24, node.w * 0.05)
-    runGeneration({
-      perform: () => imageRestyle({ src, prompt, model: mdl, references: refs }),
-      prompt,
-      action: 'edit',
-      model: mdl,
-      // Restyle returns an OPAQUE image: drop any transparent flag the source carried, or the
-      // canvas would keep rendering it with the checkerboard treatment.
-      res: { w: node.w, h: node.h, nW: node.nW, nH: node.nH, transparent: false },
-      baseX: node.x + node.w + gap,
-      baseY: node.y,
-      colW: node.w + gap,
-      // The built prompt is ~1k of boilerplate — keep it out of the recent-prompt chips.
-      remember: false
-    })
+    restyleOn({ node, guide, materials, extra: promptText, model })
     clearSelection()
     setPromptText('')
     setErr(null)
-  }, [selection, guideId, materials, promptText, model, nodeById, runGeneration, clearSelection])
+  }, [selection, guideId, materials, promptText, model, nodeById, restyleOn, clearSelection])
 
   // Extract a selection (a drawn region OR a whole frame). `mode` picks the algorithm:
   //   isolate    → cut the described element out, text removed, transparent background
   //   background → remove the foreground + text, keep only the (opaque) background scene
   const doExtract = useCallback(
-    (sel: Sel, prompt: string, mode: ExtractMode = 'isolate') => {
+    (
+      sel: Sel,
+      prompt: string,
+      mode: ExtractMode = 'isolate',
+      opts?: {
+        model?: string
+        count?: number
+        jobId?: string
+        onDone?: (r: { ids: string[]; errors: string[]; aborted: boolean }) => void
+      }
+    ) => {
       const node = nodeById(sel.imgId)
       if (!node) return
       const rx = node.nW / node.w
       const ry = node.nH / node.h
       const bbox = { x: (sel.x - node.x) * rx, y: (sel.y - node.y) * ry, w: sel.w * rx, h: sel.h * ry }
       const src = node.src
-      const mdl = model
+      const mdl = opts?.model ?? model
       const gap = Math.max(24, node.w * 0.05)
       const perform =
         mode === 'background'
@@ -1094,28 +1194,39 @@ export default function Canvas({
         prompt,
         action: 'extract',
         model: mdl,
+        count: opts?.count,
         // keep the element's exact on-canvas size + aspect ratio; isolate is transparent, background is opaque
         res: { w: sel.w, h: sel.h, nW: Math.max(1, Math.round(bbox.w)), nH: Math.max(1, Math.round(bbox.h)), transparent: mode !== 'background' },
         baseX: node.x + node.w + gap,
         baseY: node.y,
         colW: sel.w + gap,
+        jobId: opts?.jobId,
+        onDone: opts?.onDone,
       })
-      // detach: close the popover so another element can be extracted right away
-      clearSelection()
-      setPromptText('')
-      setErr(null)
     },
-    [model, nodeById, runGeneration, clearSelection]
+    [model, nodeById, runGeneration]
   )
   const runExtract = useCallback(() => {
-    if (selection) doExtract(selection, promptText, extractMode)
-  }, [selection, promptText, extractMode, doExtract])
+    if (!selection) return
+    doExtract(selection, promptText, extractMode)
+    // detach: close the popover so another element can be extracted right away
+    clearSelection()
+    setPromptText('')
+    setErr(null)
+  }, [selection, promptText, extractMode, doExtract, clearSelection])
 
   // Remove background: cut everything behind the subject to transparency (whole image).
   //   'mechanical' — deterministic flood-fill (instant, solid backgrounds)
   //   'ai'         — the model handles photographic / complex backgrounds
   const doRemoveBg = useCallback(
-    async (n: ImageNode, mode: 'mechanical' | 'ai' | 'matte' = 'mechanical') => {
+    async (
+      n: ImageNode,
+      mode: 'mechanical' | 'ai' | 'matte' = 'mechanical',
+      opts?: {
+        jobId?: string
+        onDone?: (r: { ids: string[]; errors: string[]; aborted: boolean }) => void
+      }
+    ) => {
       const src = n.src
       const mdl = model
       const gap = Math.max(24, n.w * 0.05)
@@ -1130,7 +1241,8 @@ export default function Canvas({
         } catch (e) {
           setCopyToast(e instanceof Error ? e.message : 'Could not download the matting model')
           setTimeout(() => setCopyToast(null), 4000)
-          return
+          // An agent waiting on this job must not hang on a download that failed.
+          throw e instanceof Error ? e : new Error('Could not download the matting model')
         } finally {
           off()
           setMatteDl(null)
@@ -1147,10 +1259,389 @@ export default function Canvas({
         baseY: n.y,
         colW: n.w + gap,
         count: 1, // Remove BG is a single result, ignore the Runs setting
+        jobId: opts?.jobId,
+        onDone: opts?.onDone,
       })
     },
     [model, runGeneration]
   )
+
+  // ---- MCP: expose this canvas to an AI agent (see main/mcp.ts + mcpBridge.ts) ----------------
+  // Every handler goes through the SAME callbacks the buttons use, so an agent can't reach a
+  // second, subtly different pipeline — and its results are laid out by placeFree exactly like
+  // a hand-clicked run. Handlers read refs, not render-time state, because a tool call arrives
+  // long after the render that registered it.
+  useEffect(() => {
+    const decode = (src: string): Promise<{ w: number; h: number }> =>
+      new Promise((resolve, reject) => {
+        const i = new window.Image()
+        i.onload = () => resolve({ w: i.naturalWidth, h: i.naturalHeight })
+        i.onerror = () => reject(new Error('Could not decode that image.'))
+        i.src = src
+      })
+
+    const byId = (id: string): ImageNode | null => nodesRef.current.find((n) => n.id === id) ?? null
+
+    /** nodeId → that image; otherwise whatever the user has selected. */
+    const pickNode = (p: Record<string, unknown>): ImageNode => {
+      if (typeof p.nodeId === 'string' && p.nodeId && p.nodeId !== 'selected') {
+        const n = byId(p.nodeId)
+        if (!n) throw new Error(`No image with id "${p.nodeId}" on this canvas — call get_state for the current ids.`)
+        return n
+      }
+      const selId = selectionRef.current?.imgId ?? selectedIdsRef.current[0]
+      const n = selId ? byId(selId) : null
+      if (!n) {
+        throw new Error(
+          'Nothing is selected in Canvas Forge. Pass nodeId (get_state lists them), or ask the user to click an image first.'
+        )
+      }
+      return n
+    }
+
+    /** region (natural px) → a world-space Sel; else the live marquee; else the whole frame. */
+    const pickSel = (node: ImageNode, p: Record<string, unknown>): Sel => {
+      const r = p.region as { x?: number; y?: number; w?: number; h?: number } | undefined
+      if (r && typeof r.x === 'number' && typeof r.y === 'number' && typeof r.w === 'number' && typeof r.h === 'number') {
+        const sx = node.w / node.nW
+        const sy = node.h / node.nH
+        const x = clamp(r.x, 0, node.nW - 1)
+        const y = clamp(r.y, 0, node.nH - 1)
+        return {
+          imgId: node.id,
+          x: node.x + x * sx,
+          y: node.y + y * sy,
+          w: clamp(r.w, 1, node.nW - x) * sx,
+          h: clamp(r.h, 1, node.nH - y) * sy
+        }
+      }
+      const cur = selectionRef.current
+      if (cur && cur.imgId === node.id) return cur
+      return { imgId: node.id, x: node.x, y: node.y, w: node.w, h: node.h }
+    }
+
+    /** The marquee expressed back in the source image's natural pixels. */
+    const regionOf = (s: Sel | null): Record<string, number> | null => {
+      if (!s) return null
+      const n = byId(s.imgId)
+      if (!n) return null
+      const rx = n.nW / n.w
+      const ry = n.nH / n.h
+      return {
+        x: Math.round((s.x - n.x) * rx),
+        y: Math.round((s.y - n.y) * ry),
+        w: Math.round(s.w * rx),
+        h: Math.round(s.h * ry)
+      }
+    }
+
+    // Cap on how many images ride back in one reply. Eight 512px PNGs is already a lot of an
+    // agent's context; callers say out loud when they've clipped (see IMAGE_CAP users below).
+    const IMAGE_CAP = 8
+    const thumbs = async (ns: ImageNode[], max = 512): Promise<{ dataUrl: string; label?: string }[]> => {
+      const out: { dataUrl: string; label?: string }[] = []
+      for (const n of ns.slice(0, IMAGE_CAP)) {
+        const r = await renderImage(n.src, { maxSize: max })
+        const p = n.prompt && n.prompt.length > 90 ? n.prompt.slice(0, 89) + '…' : n.prompt
+        out.push({ dataUrl: r.dataUrl, label: `${n.id} · ${n.nW}x${n.nH}${p ? ` · "${p}"` : ''}` })
+      }
+      return out
+    }
+
+    const report = async (rec: JobRecord, withImages: boolean): Promise<BridgeResult> => {
+      const made = rec.nodeIds.map(byId).filter((n): n is ImageNode => !!n)
+      if (rec.status === 'failed') {
+        throw new Error(`${rec.kind} failed: ${rec.errors[0] ?? 'the model returned no image'}`)
+      }
+      const json = {
+        jobId: rec.id,
+        status: rec.status,
+        tookMs: rec.finishedAt ? rec.finishedAt - rec.startedAt : undefined,
+        created: made.map((n) => describeNode(n, false)),
+        partialErrors: rec.errors.length ? rec.errors : undefined
+      }
+      if (!withImages || !made.length) return { json }
+      return {
+        text:
+          made.length > IMAGE_CAP
+            ? `Showing the first ${IMAGE_CAP} of ${made.length} results — get_image the rest by id.`
+            : undefined,
+        json,
+        images: await thumbs(made)
+      }
+    }
+
+    /** Fire a detached job, then either wait for it or hand back its id. */
+    const asJob = async (
+      kind: string,
+      prompt: string,
+      p: Record<string, unknown>,
+      dispatch: (
+        jobId: string,
+        onDone: (r: { ids: string[]; errors: string[] }) => void
+      ) => void | Promise<void>
+    ): Promise<BridgeResult> => {
+      const jobId = uid()
+      const rec = startJob(jobId, kind, prompt)
+      try {
+        await dispatch(jobId, (r) => finishJob(jobId, r))
+      } catch (e) {
+        // Never leave the record (and any waiter) stuck on 'running'.
+        finishJob(jobId, { ids: [], errors: [e instanceof Error ? e.message : String(e)] })
+        throw e
+      }
+      if (p.wait === false) {
+        return {
+          json: { jobId, status: 'running', note: 'Dispatched. Poll job_status with this jobId (wait:true blocks until done).' }
+        }
+      }
+      await rec.done
+      return report(rec, p.returnImages !== false)
+    }
+
+    const runsOf = (p: Record<string, unknown>): number | undefined =>
+      typeof p.runs === 'number' ? clamp(Math.round(p.runs), 1, 10) : undefined
+    const modelOf = (p: Record<string, unknown>): string => (typeof p.model === 'string' && p.model ? p.model : model)
+
+    // Tell open_project that THIS project's canvas is the one now answering.
+    setActiveProject(project.id)
+
+    return registerBridge({
+      get_state: (p) => {
+        const sel = selectionRef.current
+        const all = nodesRef.current
+        const chosen = new Set(selectedIdsRef.current)
+        // A project here can hold 350+ images, each carrying the (up to ~800-char) prompt that
+        // made it — listing them all is hundreds of KB and overflows an agent's tool-result
+        // limit, which is a hard failure rather than a slow answer. So page the list and clip
+        // the prompts. The SELECTION is always returned whole: it's the thing tools default to,
+        // it's small, and it must not depend on which page you happened to ask for.
+        // Ceiling of 200 (~75 KB) rather than "as many as you like": the point of paging is that
+        // no single reply can overflow the caller's result limit, and a raised limit that still
+        // hard-fails would just move the cliff instead of removing it.
+        const limit = typeof p.limit === 'number' ? clamp(Math.round(p.limit), 1, 200) : 50
+        const offset = typeof p.offset === 'number' ? Math.max(0, Math.round(p.offset)) : 0
+        const page = all.slice(offset, offset + limit)
+        return {
+          json: {
+            project: { id: project.id, name: project.name },
+            selection: {
+              nodeIds: selectedIdsRef.current,
+              // The marked sub-region, if the user drew one. null ⇒ tools act on the whole image.
+              region: regionOf(sel),
+              regionNodeId: sel?.imgId ?? null,
+              freehand: !!sel?.stroke,
+              images: all.filter((n) => chosen.has(n.id)).map((n) => describeNode(n, true))
+            },
+            appDefaults: { model, runs: count, styleGuide: guideId || null },
+            running: pendingRef.current.map((s) => ({ jobId: s.jobId, label: s.label, x: Math.round(s.x), y: Math.round(s.y) })),
+            imageCount: all.length,
+            shown:
+              all.length > page.length
+                ? `${page.length ? offset + 1 : 0}-${offset + page.length} of ${all.length}, canvas order — raise limit or page with offset for the rest`
+                : `all ${all.length}`,
+            images: page.map((n) => describeNode(n, chosen.has(n.id), 140))
+          }
+        }
+      },
+
+      get_image: async (p) => {
+        const max = typeof p.maxSize === 'number' ? clamp(Math.round(p.maxSize), 32, 4096) : 1024
+        const ids = Array.isArray(p.nodeIds) ? (p.nodeIds as string[]) : null
+        if (ids && ids.length) {
+          const ns = ids
+            .flatMap((id) => (id === 'selected' ? selectedIdsRef.current.map(byId) : [byId(id)]))
+            .filter((n): n is ImageNode => !!n)
+          if (!ns.length) throw new Error('None of those ids are on this canvas — call get_state.')
+          const show = ns.slice(0, IMAGE_CAP)
+          return {
+            text:
+              ns.length > IMAGE_CAP
+                ? `Showing the first ${IMAGE_CAP} of ${ns.length} — ask for the rest in another call.`
+                : undefined,
+            json: show.map((n) => describeNode(n, selectedIdsRef.current.includes(n.id))),
+            images: await thumbs(show, max)
+          }
+        }
+        const node = pickNode(p)
+        const region = (p.region as { x: number; y: number; w: number; h: number } | undefined) ?? null
+        const r = await renderImage(node.src, { region, maxSize: max })
+        return {
+          json: {
+            ...describeNode(node, selectedIdsRef.current.includes(node.id)),
+            shown: `${r.w}x${r.h}${r.w < r.srcW ? ' (downscaled)' : ''}`,
+            region: region ?? undefined
+          },
+          images: [{ dataUrl: r.dataUrl }]
+        }
+      },
+
+      select: (p) => {
+        const ids = Array.isArray(p.nodeIds) ? (p.nodeIds as string[]).filter((id) => !!byId(id)) : null
+        if (ids && ids.length) setSelectedIds(ids)
+        const wantsRegion = !!p.region || p.wholeFrame === true || typeof p.nodeId === 'string'
+        if (!wantsRegion) {
+          if (!ids?.length) throw new Error('Give nodeIds, or a nodeId with a region / wholeFrame.')
+          setSelection(null)
+          return { text: `Selected ${ids.length} image(s).` }
+        }
+        const node = typeof p.nodeId === 'string' && p.nodeId ? pickNode(p) : pickNode({ nodeId: ids?.[0] })
+        const sel = p.wholeFrame === true ? { imgId: node.id, x: node.x, y: node.y, w: node.w, h: node.h } : pickSel(node, p)
+        if (!ids?.length) setSelectedIds([node.id])
+        setSelection(sel)
+        setErr(null)
+        return { text: `Selected ${node.id}${p.region || p.wholeFrame ? ' and marked a region' : ''}.`, json: { region: regionOf(sel) } }
+      },
+
+      add_image: async (p) => {
+        const src = toDataUrl(String(p.image ?? ''), byId)
+        const { w, h } = await decode(src)
+        let world: Pt
+        if (typeof p.x === 'number' && typeof p.y === 'number') {
+          world = { x: p.x, y: p.y }
+        } else if (!nodesRef.current.length) {
+          world = { x: 0, y: 0 } // first image on an empty canvas — addImage frames the view on it
+        } else {
+          const right = Math.max(...nodesRef.current.map((n) => n.x + n.w))
+          const top = Math.min(...nodesRef.current.map((n) => n.y))
+          world = placeFree(right + 40, top, w, h)
+        }
+        const node = await addImage(src, undefined, {
+          world,
+          name: typeof p.name === 'string' ? p.name : undefined,
+          select: p.select !== false
+        })
+        setRevealIds((r) => [...r, node.id])
+        return { text: `Added ${node.nW}x${node.nH} image to "${project.name}".`, json: describeNode(node, p.select !== false) }
+      },
+
+      copy_image: async (p) => {
+        const node = pickNode(p)
+        const r = await window.api.copyImage(node.src)
+        if (r?.error) throw new Error(r.error)
+        return { text: `Copied ${node.id} (${node.nW}x${node.nH}) to the system clipboard.` }
+      },
+
+      duplicate: (p) => {
+        const ids = Array.isArray(p.nodeIds) && p.nodeIds.length ? (p.nodeIds as string[]) : [pickNode(p).id]
+        const sources = ids.map(byId).filter((n): n is ImageNode => !!n)
+        if (!sources.length) throw new Error('No matching images to duplicate.')
+        const before = new Set(nodesRef.current.map((n) => n.id))
+        pasteNodes(sources)
+        const added = nodesRef.current.filter((n) => !before.has(n.id))
+        return { text: `Duplicated ${added.length} image(s).`, json: added.map((n) => describeNode(n, true)) }
+      },
+
+      delete_images: (p) => {
+        const ids = Array.isArray(p.nodeIds) && p.nodeIds.length ? (p.nodeIds as string[]) : [pickNode(p).id]
+        const gone = ids.map(byId).filter((n): n is ImageNode => !!n)
+        if (!gone.length) throw new Error('None of those ids are on this canvas.')
+        const drop = new Set(gone.map((n) => n.id))
+        pushHistory() // Cmd+Z in the app puts them back
+        apply(nodesRef.current.filter((n) => !drop.has(n.id)))
+        setSelectedIds(selectedIdsRef.current.filter((id) => !drop.has(id)))
+        if (selectionRef.current && drop.has(selectionRef.current.imgId)) setSelection(null)
+        return { text: `Deleted ${gone.length} image(s): ${gone.map((n) => n.id).join(', ')}. Undo with Cmd+Z in the app.` }
+      },
+
+      generate: (p) => {
+        const node = pickNode(p)
+        const sel = pickSel(node, p)
+        const prompts = Array.isArray(p.prompts) && p.prompts.length ? (p.prompts as string[]).map(String) : undefined
+        const prompt = String(p.prompt ?? prompts?.[0] ?? '')
+        const refs = Array.isArray(p.references) ? (p.references as string[]).slice(0, 4).map((v) => toDataUrl(String(v), byId)) : []
+        if (!prompt.trim() && !prompts?.length && !refs.length) {
+          throw new Error('Give a prompt (what should change), prompts (one per run), or at least one reference image.')
+        }
+        return asJob('generate', prompt, p, (jobId, onDone) =>
+          generateOn({
+            node,
+            sel,
+            prompt,
+            prompts,
+            model: modelOf(p),
+            references: refs,
+            count: runsOf(p),
+            jobId,
+            onDone
+          })
+        )
+      },
+
+      extract: (p) => {
+        const node = pickNode(p)
+        const sel = pickSel(node, p)
+        const mode: ExtractMode = p.mode === 'background' ? 'background' : 'isolate'
+        const prompt = String(p.prompt ?? '')
+        return asJob('extract', prompt, p, (jobId, onDone) =>
+          doExtract(sel, prompt, mode, { model: modelOf(p), count: runsOf(p), jobId, onDone })
+        )
+      },
+
+      remove_background: (p) => {
+        const node = pickNode(p)
+        // 'precise' is the user-facing name for the local matting network ('matte' internally).
+        const mode = p.mode === 'ai' ? 'ai' : p.mode === 'precise' || p.mode === 'matte' ? 'matte' : 'mechanical'
+        return asJob('remove_background', '', p, (jobId, onDone) => doRemoveBg(node, mode, { jobId, onDone }))
+      },
+
+      restyle: (p) => {
+        const node = pickNode(p)
+        const guide = STYLE_GUIDES.find((g) => g.id === p.guideId)
+        if (!guide) {
+          throw new Error(`Unknown style guide "${p.guideId}". Available: ${STYLE_GUIDES.map((g) => g.id).join(', ')}.`)
+        }
+        const mats = Array.isArray(p.materials) ? (p.materials as string[]).filter((m) => guide.materials.some((x) => x.id === m)) : []
+        return asJob('restyle', guide.name, p, (jobId, onDone) =>
+          restyleOn({
+            node,
+            guide,
+            materials: mats,
+            extra: String(p.prompt ?? ''),
+            model: modelOf(p),
+            count: runsOf(p),
+            jobId,
+            onDone
+          })
+        )
+      },
+
+      list_style_guides: () => ({
+        json: STYLE_GUIDES.map((g) => ({
+          id: g.id,
+          name: g.name,
+          blurb: g.blurb,
+          description: g.description,
+          materials: g.materials.map((m) => ({ id: m.id, name: m.name, blurb: m.blurb }))
+        }))
+      }),
+
+      job_status: async (p) => {
+        const rec = getJob(String(p.jobId ?? ''))
+        if (!rec) throw new Error(`No job "${p.jobId}" — it may predate a restart. Dispatch a new one.`)
+        if (p.wait === true) await rec.done
+        if (rec.status === 'running') return { json: { jobId: rec.id, status: 'running', kind: rec.kind, startedAt: new Date(rec.startedAt).toISOString() } }
+        return report(rec, p.returnImages !== false)
+      }
+    })
+  }, [
+    project.id,
+    project.name,
+    model,
+    count,
+    guideId,
+    generateOn,
+    doExtract,
+    doRemoveBg,
+    restyleOn,
+    addImage,
+    pasteNodes,
+    placeFree,
+    apply,
+    pushHistory,
+    setSelectedIds,
+    setSelection
+  ])
 
   // Cancel just the prompt popover (does NOT stop already-dispatched jobs).
   const cancelPrompt = () => {
@@ -1219,7 +1710,7 @@ export default function Canvas({
     } finally {
       setMagicBusy(false)
     }
-  }, [magic, magicText, nodeById])
+  }, [magic, magicText, nodeById, setSelectedIds, setSelection])
   const modelShort = (m?: string) => (m === 'gemini-2.5-flash-image' ? 'Flash' : m === 'gemini-3-pro-image' ? 'Pro' : '')
   const fmtDate = (ms: number) =>
     new Date(ms).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
@@ -1934,21 +2425,21 @@ export default function Canvas({
             <button
               className="tbtn"
               title="Remove BG (mechanical): instant flood-fill for a solid/flat background — no model, exact edges, keeps enclosed windows transparent"
-              onClick={() => doRemoveBg(liveNode, 'mechanical')}
+              onClick={() => void doRemoveBg(liveNode, 'mechanical').catch(() => {})}
             >
               Remove BG
             </button>
             <button
               className="tbtn"
               title="Remove BG (AI): uses the model to cut the subject from a photographic / complex background"
-              onClick={() => doRemoveBg(liveNode, 'ai')}
+              onClick={() => void doRemoveBg(liveNode, 'ai').catch(() => {})}
             >
               Remove BG (AI)
             </button>
             <button
               className="tbtn"
               title="Remove BG (Precise): a local matting network (BiRefNet) with guided-filter edge refinement — soft-edged cutout for photographic subjects; runs on your machine (one-time 224 MB model download)"
-              onClick={() => doRemoveBg(liveNode, 'matte')}
+              onClick={() => void doRemoveBg(liveNode, 'matte').catch(() => {})}
             >
               Remove BG (Precise)
             </button>

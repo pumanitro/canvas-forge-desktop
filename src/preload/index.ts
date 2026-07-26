@@ -34,7 +34,27 @@ const api = {
     const h = (_e: unknown, p: { id: string; progress: number }): void => cb(p)
     ipcRenderer.on('matte:progress', h)
     return () => ipcRenderer.off('matte:progress', h)
-  }
+  },
+
+  // --- MCP: the main process forwards agent tool calls here; the renderer answers ---
+  onMcpCall: (cb: (msg: { id: string; method: string; params: unknown }) => void) => {
+    const h = (_e: unknown, msg: { id: string; method: string; params: unknown }): void => cb(msg)
+    ipcRenderer.on('mcp:call', h)
+    return () => ipcRenderer.off('mcp:call', h)
+  },
+  mcpResult: (id: string, payload: { data?: unknown; error?: string }) =>
+    ipcRenderer.send('mcp:result', { id, ...payload }),
+  mcpInfo: () =>
+    ipcRenderer.invoke('mcp:info') as Promise<{
+      enabled: boolean
+      port: number | null
+      url: string | null
+      error: string | null
+      toolCount: number
+      toolNames: string[]
+      lastCallAt: number | null
+      clients: { name: string; at: number; calls: number }[]
+    }>
 }
 
 if (process.contextIsolated) {

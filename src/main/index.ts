@@ -16,6 +16,7 @@ import {
   setSetting
 } from './store'
 import { ensureModel, matteInputSize, modelReady, runMatte, shutdownMatte, type ModelId } from './matte'
+import { registerMcpIpc, startMcpServer, stopMcpServer } from './mcp'
 
 // DEV ONLY: expose a Chrome DevTools Protocol endpoint so the app can be driven /
 // inspected/tested over CDP (like a browser tab). Never enabled in a packaged build.
@@ -312,14 +313,20 @@ if (!app.requestSingleInstanceLock()) {
     app.on('browser-window-created', (_, window) => optimizer.watchWindowShortcuts(window))
     buildAppMenu()
     registerIpc()
+    registerMcpIpc()
     createWindow()
+    // MCP: let an AI agent drive this window (see main/mcp.ts).
+    startMcpServer()
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()
     })
   })
 
   // The matting worker is a detached child; without this it outlives the app on quit.
-  app.on('before-quit', () => shutdownMatte())
+  app.on('before-quit', () => {
+    shutdownMatte()
+    stopMcpServer()
+  })
 }
 
 app.on('window-all-closed', () => {

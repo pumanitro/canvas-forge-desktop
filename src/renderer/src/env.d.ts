@@ -37,6 +37,19 @@ declare global {
       matteEnsure: (id: string) => Promise<{ ok: boolean; error?: string }>
       matteRun: (id: string, rgba: Uint8Array) => Promise<{ alpha?: Float32Array; error?: string }>
       onMatteProgress: (cb: (p: { id: string; progress: number }) => void) => () => void
+      // MCP bridge (see main/mcp.ts + mcpBridge.ts)
+      onMcpCall: (cb: (msg: { id: string; method: string; params: unknown }) => void) => () => void
+      mcpResult: (id: string, payload: { data?: unknown; error?: string }) => void
+      mcpInfo: () => Promise<{
+        enabled: boolean
+        port: number | null
+        url: string | null
+        error: string | null
+        toolCount: number
+        toolNames: string[]
+        lastCallAt: number | null
+        clients: { name: string; at: number; calls: number }[]
+      }>
     }
   }
 }
