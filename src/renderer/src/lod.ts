@@ -12,8 +12,15 @@
 // anything drawing small, and fall back to the original only when a node is
 // genuinely being viewed near full size. A card in the sidebar is ~150 px wide;
 // asking for 1536 px of pixels to fill it is three orders of magnitude of waste.
+//
+// Two kinds of node come through here. A SAVED node's src is a cf-img:// URL
+// (see pixels.ts): its tiers are URLs too, served — and built, once — by the
+// main process, and Chromium's image cache does the keeping and evicting; none
+// of the machinery below runs for it. Everything below is for a node that still
+// holds a data URL because it has not been saved yet.
 
 import { useEffect, useState } from 'react'
+import { isStoredSrc, storedTier } from './pixels'
 
 /** Longest-edge sizes we keep proxies at, ascending. */
 export const TIERS = [160, 512, 1280] as const
@@ -246,6 +253,9 @@ export function lodSrc(node: Sized, wantPx: number): string {
   // would be a copy of the original: paint the real thing.
   if (want === null || natural <= want) return node.src
 
+  // On disk already: the tier is just another URL to fetch.
+  if (isStoredSrc(node.src)) return storedTier(node.src, want)
+
   const k = key(node.id, want)
   const hit = cache.get(k)
   if (hit) {
@@ -280,6 +290,7 @@ export function lodSrc(node: Sized, wantPx: number): string {
 export function lodProxy(node: Sized, tier: (typeof TIERS)[number]): Promise<string> {
   const natural = Math.max(node.nW || 0, node.nH || 0)
   if (!natural || natural <= tier) return Promise.resolve(node.src)
+  if (isStoredSrc(node.src)) return Promise.resolve(storedTier(node.src, tier))
   const k = key(node.id, tier)
   const hit = cache.get(k)
   if (hit) {

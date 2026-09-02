@@ -6,6 +6,7 @@
 
 import type { ImageNode } from './types'
 import { lodProxy } from './lod'
+import { isStoredSrc } from './pixels'
 
 export const COVER_W = 186
 export const COVER_H = 104
@@ -19,6 +20,9 @@ function loadImage(url: string): Promise<HTMLImageElement> {
     const img = new Image()
     img.onload = () => resolve(img)
     img.onerror = () => reject(new Error('cover: image failed'))
+    // A cf-img tier is another origin: without this the canvas it is drawn on
+    // is tainted and convertToBlob refuses. The protocol answers CORS.
+    if (isStoredSrc(url)) img.crossOrigin = 'anonymous'
     img.src = url
   })
 }

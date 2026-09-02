@@ -19,7 +19,8 @@ declare global {
       }>
       loadProjects: () => Promise<ProjectSummary[]>
       loadProject: (id: string) => Promise<Project | null>
-      saveProject: (p: Project) => Promise<unknown>
+      saveProject: (p: Project) => Promise<{ rewritten: Record<string, string> }>
+      onProjectMigrating: (cb: (p: { id: string; done: number; total: number }) => void) => () => void
       patchProjectMeta: (id: string, patch: { name?: string; updatedAt?: number; cover?: string }) => Promise<ProjectSummary | null>
       deleteProject: (id: string) => Promise<unknown>
       loadProjectOrder: () => Promise<string[]>
@@ -28,7 +29,7 @@ declare global {
       addPrompt: (p: string) => Promise<string[]>
       getSettings: () => Promise<{ geminiKey?: string; hasKey: boolean }>
       setKey: (key: string) => Promise<{ hasKey: boolean }>
-      exportProject: (p: Project) => Promise<{ path?: string; canceled?: boolean }>
+      exportProject: (p: Project) => Promise<{ path?: string; canceled?: boolean; error?: string }>
       importProject: () => Promise<{ project?: Project; canceled?: boolean; error?: string }>
       savePng: (dataUrl: string, name: string) => Promise<{ path?: string; canceled?: boolean; error?: string }>
       revealItem: (path: string) => Promise<{ ok?: boolean }>

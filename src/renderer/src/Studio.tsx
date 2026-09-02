@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import Canvas from './Canvas'
 import McpPanel from './McpPanel'
-import type { ImageNode, Project, ProjectSummary } from './types'
+import type { ImageNode, Project, ProjectSummary, StoredRewrite } from './types'
 import { loadProject, loadProjects, patchProjectMeta, removeProject, saveProject, saveProjectOrder } from './store'
 import { awaitProject, registerBridge } from './mcpBridge'
 import { COVER_H, COVER_W, renderCover } from './cover'
@@ -83,6 +83,51 @@ export default function Studio() {
     )
   }, [])
 
+  const flashToast = useCallback((msg: string) => {
+    setToast(msg)
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+    toastTimer.current = setTimeout(() => setToast(null), 1600)
+  }, [])
+
+  // A save writes any node still holding a data URL to disk and answers with the
+  // cf-img URL that now stands for it. That answer goes to the Canvas (through the
+  // `stored` prop) so the base64 leaves memory — from the live nodes, the undo stack
+  // and the clipboard alike. `from` is the src that was sent: a node whose pixels
+  // changed again while the save was in flight keeps its newer data URL.
+  const [stored, setStored] = useState<StoredRewrite | null>(null)
+  const storedSeq = useRef(0)
+  const persist = useCallback(
+    async (p: Project): Promise<void> => {
+      const sent = new Map(p.images.map((n) => [n.id, n.src] as const))
+      try {
+        const r = await saveProject(p)
+        const ids = r?.rewritten ? Object.keys(r.rewritten) : []
+        if (!ids.length) return
+        const map: StoredRewrite['map'] = {}
+        for (const id of ids) map[id] = { from: sent.get(id) ?? '', to: r.rewritten[id] }
+        setStored({ projectId: p.id, seq: ++storedSeq.current, map })
+      } catch (e) {
+        flashToast(`Save failed: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    },
+    [flashToast]
+  )
+  /** The Canvas applied a rewrite: mirror it, without marking the project dirty. */
+  const handleImagesStored = useCallback((images: ImageNode[]) => {
+    setCurrent((prev) => (prev ? { ...prev, images } : prev))
+  }, [])
+
+  // A legacy single-file project is split into images + layout the first time it
+  // is opened (main/store.ts). For the seconds that takes, say so.
+  const [migrating, setMigrating] = useState<{ done: number; total: number } | null>(null)
+  useEffect(
+    () =>
+      window.api.onProjectMigrating?.(({ done, total }) => {
+        setMigrating(done >= total ? null : { done, total })
+      }),
+    []
+  )
+
   useEffect(() => {
     let alive = true
     loadProjects().then((ps) => {
@@ -120,24 +165,22 @@ export default function Studio() {
     }
     const leaving = currentRef.current
     if (leaving && dirtyRef.current) {
-      void saveProject(leaving)
+      void persist(leaving)
       syncSummary(leaving)
     }
     dirtyRef.current = false
     setCurrent(null)
     loadProject(currentId).then((p) => {
       if (seq !== loadSeq.current) return
-      if (!p) return
+      setMigrating(null)
+      if (!p) {
+        flashToast('Could not open that project')
+        return
+      }
       setCurrent(p)
       syncSummary(p)
     })
-  }, [currentId, syncSummary])
-
-  const flashToast = useCallback((msg: string) => {
-    setToast(msg)
-    if (toastTimer.current) clearTimeout(toastTimer.current)
-    toastTimer.current = setTimeout(() => setToast(null), 1600)
-  }, [])
+  }, [currentId, syncSummary, persist, flashToast])
 
   // Debounced auto-save of the current project, and — on a slower clock, because
   // it decodes images — a fresh cover for its sidebar card.
@@ -150,7 +193,7 @@ export default function Studio() {
       saveTimer.current = setTimeout(() => {
         saveTimer.current = null
         dirtyRef.current = false
-        void saveProject(p)
+        void persist(p)
         syncSummary(p)
       }, 350)
     }
@@ -169,7 +212,7 @@ export default function Studio() {
         })
       }, 1500)
     }
-  }, [current, ready, syncSummary])
+  }, [current, ready, syncSummary, persist])
 
   // Cmd/Ctrl+S → save into the project (NOT the browser "save page to Desktop").
   useEffect(() => {
@@ -179,14 +222,15 @@ export default function Studio() {
         const cur = currentRef.current
         if (cur) {
           if (saveTimer.current) clearTimeout(saveTimer.current)
-          saveProject(cur)
+          dirtyRef.current = false
+          void persist(cur)
           flashToast(`Saved “${cur.name}”`)
         }
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [flashToast])
+  }, [flashToast, persist])
 
   // ---- MCP: the project-level tools (the canvas ones live in Canvas.tsx) ----
   // Registered here because only Studio knows the project list and can switch between them.
@@ -470,16 +514,17 @@ export default function Studio() {
     }
   }
 
+  // Main reads the file and files its images straight into the store (a clashing
+  // id is reassigned there); what comes back is the KB-sized layout, already saved.
   const importProject = async () => {
     const r = await window.api.importProject()
+    setMigrating(null)
     if (r?.canceled) return
     if (r?.error || !r?.project) {
       flashToast(r?.error || 'Import failed')
       return
     }
-    let p = r.project as Project
-    if (projects.some((x) => x.id === p.id)) p = { ...p, id: uid(), name: `${p.name || 'Untitled'} (imported)` }
-    await saveProject(p)
+    const p = r.project as Project
     const next = [summaryOf(p), ...projects.filter((x) => x.id !== p.id)]
     setProjects(next)
     commitOrder(next)
@@ -488,14 +533,16 @@ export default function Studio() {
   }
 
   const exportProject = async (s: ProjectSummary) => {
-    // Only the open project is in memory; anything else is read from disk for the export.
+    // Only the open project is in memory; anything else is read from disk for the
+    // export. Either way main inlines the images from the store into the file.
     const p = currentRef.current?.id === s.id ? currentRef.current : await loadProject(s.id)
     if (!p) {
       flashToast('Could not read that project')
       return
     }
     const r = await window.api.exportProject(p)
-    if (r?.path) flashToast('Exported to file')
+    if (r?.error) flashToast(r.error)
+    else if (r?.path) flashToast('Exported to file')
   }
 
   return (
@@ -611,8 +658,22 @@ export default function Studio() {
       </aside>
 
       <main className="stage">
-        {ready && current ? <Canvas key={current.id} project={current} onImagesChange={handleImagesChange} /> : null}
-        {toast ? <div className="toast">{toast}</div> : null}
+        {ready && current ? (
+          <Canvas
+            key={current.id}
+            project={current}
+            onImagesChange={handleImagesChange}
+            stored={stored}
+            onImagesStored={handleImagesStored}
+          />
+        ) : null}
+        {migrating ? (
+          <div className="toast">
+            Converting project to the new format… {migrating.done}/{migrating.total} images
+          </div>
+        ) : toast ? (
+          <div className="toast">{toast}</div>
+        ) : null}
       </main>
       {mcpOpen ? <McpPanel onClose={() => setMcpOpen(false)} /> : null}
     </div>

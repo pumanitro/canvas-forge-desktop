@@ -24,7 +24,7 @@ export function saveProjectOrder(ids: string[]): Promise<unknown> {
 export function loadProject(id: string): Promise<Project | null> {
   return window.api.loadProject(id)
 }
-export function saveProject(p: Project): Promise<unknown> {
+export function saveProject(p: Project): Promise<{ rewritten: Record<string, string> }> {
   return window.api.saveProject(p)
 }
 export function patchProjectMeta(

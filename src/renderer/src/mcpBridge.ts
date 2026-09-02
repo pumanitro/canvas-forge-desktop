@@ -6,6 +6,7 @@
 // on what is on screen at that moment rather than on a stale snapshot.
 
 import type { ImageNode } from './types'
+import { resolvePixels } from './pixels'
 
 /** What a handler returns; main turns this into MCP content blocks. */
 export type BridgeResult = {
@@ -155,15 +156,22 @@ export function describeNode(
   }
 }
 
-/** Accept a data URL, a bare base64 blob, or "node:<id>" and hand back a data URL. */
-export function toDataUrl(v: string, lookup?: (id: string) => ImageNode | null): string {
+/** An image argument — a data URL, a bare base64 blob, or "node:<id>" — as a
+ *  data URL. A canvas node's pixels live on disk, so this is async. */
+export async function resolveImageArg(v: string, lookup?: (id: string) => ImageNode | null): Promise<string> {
   const s = v.trim()
-  if (s.startsWith('data:')) return s
   if (s.startsWith('node:')) {
     const n = lookup?.(s.slice(5).trim())
     if (!n) throw new Error(`No canvas image with id "${s.slice(5).trim()}".`)
-    return n.src
+    return resolvePixels(n)
   }
+  return toDataUrl(s)
+}
+
+/** Accept a data URL or a bare base64 blob and hand back a data URL. */
+export function toDataUrl(v: string): string {
+  const s = v.trim()
+  if (s.startsWith('data:')) return s
   if (!/^[A-Za-z0-9+/=\s]+$/.test(s) || s.length < 32) {
     throw new Error('Expected a data: URL, bare base64 image data, or "node:<id>".')
   }

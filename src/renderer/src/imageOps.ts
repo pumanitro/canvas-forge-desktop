@@ -1,5 +1,6 @@
 import { clamp } from './util'
 import { matteAlpha } from './matte'
+import { isStoredSrc } from './pixels'
 
 // All image processing happens here in the renderer via the 2D canvas — so the
 // desktop app needs no native modules (sharp) at all. Gemini itself is called in
@@ -13,6 +14,7 @@ function loadImg(src: string): Promise<HTMLImageElement> {
     const img = new Image()
     img.onload = () => resolve(img)
     img.onerror = () => reject(new Error('image load failed'))
+    if (isStoredSrc(src)) img.crossOrigin = 'anonymous' // keep the canvas untainted
     img.src = src
   })
 }

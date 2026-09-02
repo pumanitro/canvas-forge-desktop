@@ -1,6 +1,6 @@
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import type { ImageNode, Project } from './types'
+import type { ImageNode, Project, StoredRewrite } from './types'
 import { clamp, uid } from './util'
 import { addPrompt, loadPrompts } from './store'
 import { imageEdit, imageExtract, imageExtractBackground, imageRemoveBg, imageRestyle, renderImage } from './imageOps'
@@ -9,15 +9,16 @@ import {
   finishJob,
   getJob,
   registerBridge,
+  resolveImageArg,
   setActiveProject,
   startJob,
-  toDataUrl,
   type BridgeResult,
   type JobRecord
 } from './mcpBridge'
 import { STYLE_GUIDES, buildRestylePrompt, refsFor, type StyleGuide } from './styleguides'
 import { ensureMatteModel, matteModelReady, onMatteProgress } from './matte'
 import { lodSrc, pruneLod, useLodVersion } from './lod'
+import { pixelsOf, resolvePixels } from './pixels'
 
 type View = { x: number; y: number; zoom: number }
 type Tool = 'move' | 'rect' | 'draw' | 'magic'
@@ -83,9 +84,15 @@ function cropNodeRegion(src: string, bx: number, by: number, bw: number, bh: num
 export default function Canvas({
   project,
   onImagesChange,
+  stored,
+  onImagesStored,
 }: {
   project: Project
   onImagesChange: (images: ImageNode[]) => void
+  /** From the last save: the cf-img URL now standing for each data URL it wrote. */
+  stored?: StoredRewrite | null
+  /** Called after `stored` is applied — a bookkeeping update, not an edit. */
+  onImagesStored?: (images: ImageNode[]) => void
 }) {
   const [nodes, setNodes] = useState<ImageNode[]>(project.images)
   const nodesRef = useRef<ImageNode[]>(project.images)
@@ -147,7 +154,10 @@ export default function Canvas({
     const by = Math.round((m.y - node.y) * ry)
     const bw = Math.max(1, Math.round(m.w * rx))
     const bh = Math.max(1, Math.round(m.h * ry))
-    cropNodeRegion(node.src, bx, by, bw, bh).then((src) => setReferences((prev) => [...prev, { id: uid(), src }].slice(-4)))
+    void resolvePixels(node)
+      .then((src) => cropNodeRegion(src, bx, by, bw, bh))
+      .then((src) => setReferences((prev) => [...prev, { id: uid(), src }].slice(-4)))
+      .catch(() => {})
   }, [])
 
   const [marquee, setMarquee] = useState<Sel | null>(null)
@@ -238,6 +248,33 @@ export default function Canvas({
   const spaceDownRef = useRef(false)
   // undo history for THIS project, restored from the module store so it survives remounts
   const undoRef = useRef<ImageNode[][]>(undoStore.get(project.id) ?? [])
+
+  // A save landed: every node it wrote to disk now has a cf-img URL. Swap it in
+  // wherever that node object lives — the live list, the undo stack, the clipboard —
+  // so nothing keeps the base64 alive. A node whose src moved on since the save
+  // (the `from` check) keeps its newer pixels for the next save to write.
+  useEffect(() => {
+    if (!stored || stored.projectId !== project.id) return
+    const swap = (list: ImageNode[]): ImageNode[] => {
+      let changed = false
+      const next = list.map((n) => {
+        const r = stored.map[n.id]
+        if (!r || n.src !== r.from) return n
+        changed = true
+        return { ...n, src: r.to }
+      })
+      return changed ? next : list
+    }
+    undoRef.current = undoRef.current.map(swap)
+    undoStore.set(project.id, undoRef.current)
+    clipboardStore.nodes = swap(clipboardStore.nodes)
+    const next = swap(nodesRef.current)
+    if (next !== nodesRef.current) {
+      nodesRef.current = next
+      setNodes(next)
+      onImagesStored?.(next)
+    }
+  }, [stored, project.id, onImagesStored])
   // one AbortController per in-flight job (keyed by jobId) so a job can be cancelled
   // from its own placeholder without touching the other jobs running alongside it.
   const jobAborts = useRef<Map<string, AbortController>>(new Map())
@@ -336,7 +373,7 @@ export default function Canvas({
     setSuggesting(true)
     setSuggestNote(null)
     try {
-      const r = await window.api.variants({ image: node.src, prompt: promptText, count })
+      const r = await window.api.variants({ image: await resolvePixels(node), prompt: promptText, count })
       if (r.error || !r.variants?.length) {
         setSuggestNote(r.error || 'no suggestions came back')
         return
@@ -538,7 +575,9 @@ export default function Canvas({
           if (selectedIds.length === 1) {
             const n = nodesRef.current.find((x) => x.id === selectedIds[0])
             if (n) {
-              window.api.copyImage(n.src)
+              void resolvePixels(n)
+                .then((src) => window.api.copyImage(src))
+                .catch(() => {})
               setCopyToast('Image copied to clipboard')
               window.setTimeout(() => setCopyToast(null), 1400)
             }
@@ -1062,13 +1101,13 @@ export default function Canvas({
       const strokeReq = sel.stroke
         ? { points: sel.stroke.map((q) => ({ x: (q.x - node.x) * rx, y: (q.y - node.y) * ry })), radius: (sel.brush ?? 0) * rx }
         : undefined
-      const src = node.src
+      const pixels = pixelsOf(node) // fetched once, shared by every run
       const transparent = node.transparent
       const gap = Math.max(24, node.w * 0.05)
       runGeneration({
-        perform: (i) =>
+        perform: async (i) =>
           imageEdit({
-            src,
+            src: await pixels,
             bbox,
             prompt: p.prompts?.[i] ?? p.prompt,
             model: p.model,
@@ -1135,11 +1174,11 @@ export default function Canvas({
       const { node } = p
       const mats = p.materials.length ? p.materials : p.guide.materials.map((m) => m.id)
       const prompt = buildRestylePrompt(p.guide, mats, p.extra)
-      const src = node.src
+      const pixels = pixelsOf(node)
       const refs = refsFor(p.guide, mats).map((r) => r.src)
       const gap = Math.max(24, node.w * 0.05)
       runGeneration({
-        perform: () => imageRestyle({ src, prompt, model: p.model, references: refs }),
+        perform: async () => imageRestyle({ src: await pixels, prompt, model: p.model, references: refs }),
         prompt,
         action: 'edit',
         model: p.model,
@@ -1191,13 +1230,13 @@ export default function Canvas({
       const rx = node.nW / node.w
       const ry = node.nH / node.h
       const bbox = { x: (sel.x - node.x) * rx, y: (sel.y - node.y) * ry, w: sel.w * rx, h: sel.h * ry }
-      const src = node.src
+      const pixels = pixelsOf(node)
       const mdl = opts?.model ?? model
       const gap = Math.max(24, node.w * 0.05)
       const perform =
         mode === 'background'
-          ? () => imageExtractBackground({ src, bbox, prompt, model: mdl })
-          : () => imageExtract({ src, bbox, prompt, model: mdl })
+          ? async () => imageExtractBackground({ src: await pixels, bbox, prompt, model: mdl })
+          : async () => imageExtract({ src: await pixels, bbox, prompt, model: mdl })
       runGeneration({
         perform,
         prompt,
@@ -1236,7 +1275,7 @@ export default function Canvas({
         onDone?: (r: { ids: string[]; errors: string[]; aborted: boolean }) => void
       }
     ) => {
-      const src = n.src
+      const pixels = pixelsOf(n)
       const mdl = model
       const gap = Math.max(24, n.w * 0.05)
 
@@ -1259,7 +1298,7 @@ export default function Canvas({
       }
 
       runGeneration({
-        perform: () => imageRemoveBg({ src, model: mdl, mode }),
+        perform: async () => imageRemoveBg({ src: await pixels, model: mdl, mode }),
         prompt: '',
         action: 'extract',
         model: mdl,
@@ -1350,7 +1389,7 @@ export default function Canvas({
     const thumbs = async (ns: ImageNode[], max = 512): Promise<{ dataUrl: string; label?: string }[]> => {
       const out: { dataUrl: string; label?: string }[] = []
       for (const n of ns.slice(0, IMAGE_CAP)) {
-        const r = await renderImage(n.src, { maxSize: max })
+        const r = await renderImage(await resolvePixels(n), { maxSize: max })
         const p = n.prompt && n.prompt.length > 90 ? n.prompt.slice(0, 89) + '…' : n.prompt
         out.push({ dataUrl: r.dataUrl, label: `${n.id} · ${n.nW}x${n.nH}${p ? ` · "${p}"` : ''}` })
       }
@@ -1474,7 +1513,7 @@ export default function Canvas({
         }
         const node = pickNode(p)
         const region = (p.region as { x: number; y: number; w: number; h: number } | undefined) ?? null
-        const r = await renderImage(node.src, { region, maxSize: max })
+        const r = await renderImage(await resolvePixels(node), { region, maxSize: max })
         return {
           json: {
             ...describeNode(node, selectedIdsRef.current.includes(node.id)),
@@ -1503,7 +1542,7 @@ export default function Canvas({
       },
 
       add_image: async (p) => {
-        const src = toDataUrl(String(p.image ?? ''), byId)
+        const src = await resolveImageArg(String(p.image ?? ''), byId)
         const { w, h } = await decode(src)
         let world: Pt
         if (typeof p.x === 'number' && typeof p.y === 'number') {
@@ -1526,7 +1565,7 @@ export default function Canvas({
 
       copy_image: async (p) => {
         const node = pickNode(p)
-        const r = await window.api.copyImage(node.src)
+        const r = await window.api.copyImage(await resolvePixels(node))
         if (r?.error) throw new Error(r.error)
         return { text: `Copied ${node.id} (${node.nW}x${node.nH}) to the system clipboard.` }
       },
@@ -1553,12 +1592,14 @@ export default function Canvas({
         return { text: `Deleted ${gone.length} image(s): ${gone.map((n) => n.id).join(', ')}. Undo with Cmd+Z in the app.` }
       },
 
-      generate: (p) => {
+      generate: async (p) => {
         const node = pickNode(p)
         const sel = pickSel(node, p)
         const prompts = Array.isArray(p.prompts) && p.prompts.length ? (p.prompts as string[]).map(String) : undefined
         const prompt = String(p.prompt ?? prompts?.[0] ?? '')
-        const refs = Array.isArray(p.references) ? (p.references as string[]).slice(0, 4).map((v) => toDataUrl(String(v), byId)) : []
+        const refs = Array.isArray(p.references)
+          ? await Promise.all((p.references as string[]).slice(0, 4).map((v) => resolveImageArg(String(v), byId)))
+          : []
         if (!prompt.trim() && !prompts?.length && !refs.length) {
           throw new Error('Give a prompt (what should change), prompts (one per run), or at least one reference image.')
         }
@@ -1674,7 +1715,7 @@ export default function Canvas({
     setMagicBusy(true)
     setMagicErr(null)
     try {
-      const r = await window.api.detect({ image: node.src, description: magicText })
+      const r = await window.api.detect({ image: await resolvePixels(node), description: magicText })
       if (r.error) throw new Error(r.error)
       if (!r.box) {
         setMagicErr('Could not find that element — try describing it differently.')
@@ -1809,7 +1850,15 @@ export default function Canvas({
   }
 
   const savePngFor = async (n: ImageNode): Promise<void> => {
-    const r = await window.api.savePng(n.src, n.prompt || 'canvas-forge')
+    let src: string
+    try {
+      src = await resolvePixels(n)
+    } catch (e) {
+      setCopyToast(e instanceof Error ? e.message : 'Could not read that image')
+      window.setTimeout(() => setCopyToast(null), 4000)
+      return
+    }
+    const r = await window.api.savePng(src, n.prompt || 'canvas-forge')
     if (r?.canceled) return
     if (r?.error) {
       setCopyToast(r.error)
@@ -1828,7 +1877,15 @@ export default function Canvas({
     const set = new Set(selectedIdsRef.current)
     const sel = nodesRef.current.filter((n) => set.has(n.id))
     if (!sel.length) return
-    const items = sel.map((n, i) => ({ name: n.prompt ? n.prompt.slice(0, 50) : `image-${i + 1}`, dataUrl: n.src }))
+    let srcs: string[]
+    try {
+      srcs = await Promise.all(sel.map((n) => resolvePixels(n)))
+    } catch (e) {
+      setCopyToast(e instanceof Error ? e.message : 'Could not read those images')
+      window.setTimeout(() => setCopyToast(null), 4000)
+      return
+    }
+    const items = sel.map((n, i) => ({ name: n.prompt ? n.prompt.slice(0, 50) : `image-${i + 1}`, dataUrl: srcs[i] }))
     const r = await window.api.exportZip(items, project.name || 'canvas-forge')
     if (r?.canceled) return
     if (r?.error) {

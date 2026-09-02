@@ -4,7 +4,9 @@
  *  units; nW/nH are the image's natural pixel size (what we send to the model). */
 export type ImageNode = {
   id: string
-  src: string // data URL (natural-res; replaced in place after an edit)
+  /** Where the pixels are: `cf-img://<projectId>/<id>/full` once saved (main
+   *  serves the bytes on demand — see pixels.ts), a data URL until then. */
+  src: string
   x: number // world x of top-left
   y: number // world y of top-left
   w: number // displayed width in world units
@@ -37,6 +39,15 @@ export type ProjectSummary = {
   imageCount: number
   /** Small WebP data URL of the mini-map, painted by the renderer on save. */
   cover?: string
+}
+
+/** What a save hands back: for every node whose data URL main wrote to disk,
+ *  the URL that now stands for it. `from` is the src that was sent, so a node
+ *  edited again while the save was in flight keeps its newer pixels. */
+export type StoredRewrite = {
+  projectId: string
+  seq: number
+  map: Record<string, { from: string; to: string }>
 }
 
 /** Selection rectangle in the natural-pixel space of a single image. */
