@@ -158,7 +158,10 @@ export function describeNode(
 
 /** An image argument — a data URL, a bare base64 blob, or "node:<id>" — as a
  *  data URL. A canvas node's pixels live on disk, so this is async. */
-export async function resolveImageArg(v: string, lookup?: (id: string) => ImageNode | null): Promise<string> {
+export async function resolveImageArg(
+  v: string,
+  lookup?: (id: string) => ImageNode | null
+): Promise<string> {
   const s = v.trim()
   if (s.startsWith('node:')) {
     const n = lookup?.(s.slice(5).trim())

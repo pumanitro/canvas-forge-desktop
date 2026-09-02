@@ -20,7 +20,9 @@ declare global {
       loadProjects: () => Promise<ProjectSummary[]>
       loadProject: (id: string) => Promise<Project | null>
       saveProject: (p: Project) => Promise<{ rewritten: Record<string, string> }>
-      onProjectMigrating: (cb: (p: { id: string; done: number; total: number }) => void) => () => void
+      onProjectMigrating: (
+        cb: (p: { id: string; done: number; total: number }) => void
+      ) => () => void
       patchProjectMeta: (id: string, patch: { name?: string; updatedAt?: number; cover?: string }) => Promise<ProjectSummary | null>
       deleteProject: (id: string) => Promise<unknown>
       loadProjectOrder: () => Promise<string[]>

@@ -27,7 +27,11 @@ const api = {
   getSettings: () => ipcRenderer.invoke('settings:get') as Promise<{ geminiKey?: string; hasKey: boolean }>,
   setKey: (key: string) => ipcRenderer.invoke('settings:setKey', key) as Promise<{ hasKey: boolean }>,
   exportProject: (p: unknown) =>
-    ipcRenderer.invoke('project:export', p) as Promise<{ path?: string; canceled?: boolean; error?: string }>,
+    ipcRenderer.invoke('project:export', p) as Promise<{
+      path?: string
+      canceled?: boolean
+      error?: string
+    }>,
   importProject: () => ipcRenderer.invoke('project:import') as Promise<{ project?: unknown; canceled?: boolean; error?: string }>,
   savePng: (dataUrl: string, name: string) =>
     ipcRenderer.invoke('image:savePng', { dataUrl, name }) as Promise<{ path?: string; canceled?: boolean; error?: string }>,
