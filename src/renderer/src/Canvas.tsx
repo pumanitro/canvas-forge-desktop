@@ -17,6 +17,7 @@ import {
 } from './mcpBridge'
 import { STYLE_GUIDES, buildRestylePrompt, refsFor, type StyleGuide } from './styleguides'
 import { ensureMatteModel, matteModelReady, onMatteProgress } from './matte'
+import { lodSrc, pruneLod, useLodVersion } from './lod'
 
 type View = { x: number; y: number; zoom: number }
 type Tool = 'move' | 'rect' | 'draw' | 'magic'
@@ -223,6 +224,14 @@ export default function Canvas({
   const [panning, setPanning] = useState(false)
   const [dropping, setDropping] = useState(false)
   const [vp, setVp] = useState({ w: 0, h: 0 })
+  // Re-render when a downscaled proxy finishes building (see lod.ts).
+  useLodVersion()
+  // Release proxies for nodes that are gone. Keyed on the id set, not the array,
+  // so dragging a node around does not churn the cache.
+  const nodeIdKey = nodes.map((n) => n.id).join(',')
+  useEffect(() => {
+    pruneLod(nodeIdKey ? nodeIdKey.split(',') : [])
+  }, [nodeIdKey])
 
   const viewportRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef<Drag | null>(null)
@@ -1862,6 +1871,26 @@ export default function Canvas({
   const strokeWidthPx = strokeBrushWorld * view.zoom * 2
   const bandScreen = band ? { ...w2s(band.x, band.y), w: band.w * view.zoom, h: band.h * view.zoom } : null
 
+  // Only mount the nodes that can actually be seen. A project spreads its rows
+  // across tens of thousands of world units, so at any useful zoom most of them
+  // are far off-screen — and an <img> off-screen still costs its decoded bitmap.
+  // The margin keeps a screenful of slack either side so panning has something
+  // to reveal instead of popping.
+  const cullMargin = 600 / view.zoom
+  const visX0 = -view.x / view.zoom - cullMargin
+  const visY0 = -view.y / view.zoom - cullMargin
+  const visX1 = (vp.w - view.x) / view.zoom + cullMargin
+  const visY1 = (vp.h - view.y) / view.zoom + cullMargin
+  const paintNodes = nodes.filter(
+    (n) =>
+      !n.hidden &&
+      n.x < visX1 &&
+      n.x + n.w > visX0 &&
+      n.y < visY1 &&
+      n.y + n.h > visY0
+  )
+  const dpr = window.devicePixelRatio || 1
+
   let popLeft = 0
   let popTop = 0
   if (selScreen) {
@@ -1891,7 +1920,7 @@ export default function Canvas({
       }}
     >
       <div className="world" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})` }}>
-        {nodes.filter((n) => !n.hidden).map((n) => (
+        {paintNodes.map((n) => (
           <div
             key={n.id}
             className={'node' + (selectedIds.includes(n.id) ? ' selected' : '') + (revealIds.includes(n.id) ? ' reveal' : '') + (n.transparent ? ' transparent' : '')}
@@ -1908,7 +1937,12 @@ export default function Canvas({
             onAnimationEnd={() => revealIds.includes(n.id) && setRevealIds((r) => r.filter((id) => id !== n.id))}
           >
             {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src={n.src} alt="" draggable={false} />
+            <img
+              src={lodSrc(n, Math.max(n.w, n.h) * view.zoom * dpr)}
+              alt=""
+              draggable={false}
+              decoding="async"
+            />
           </div>
         ))}
       </div>
@@ -2492,7 +2526,7 @@ export default function Canvas({
                     </button>
                     <span className="lp-thumb">
                       {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img src={n.src} alt="" />
+                      <img src={lodSrc(n, 64 * dpr)} alt="" decoding="async" />
                     </span>
                     {renamingLayer === n.id ? (
                       <input

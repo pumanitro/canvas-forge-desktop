@@ -7,7 +7,10 @@ const api = {
   variants: (opts: { image: string; prompt: string; count: number }) =>
     ipcRenderer.invoke('gemini:variants', opts) as Promise<{ variants?: { label: string; prompt: string }[]; note?: string; error?: string }>,
   loadProjects: () => ipcRenderer.invoke('projects:load'),
+  loadProject: (id: string) => ipcRenderer.invoke('projects:loadOne', id),
   saveProject: (p: unknown) => ipcRenderer.invoke('projects:save', p),
+  patchProjectMeta: (id: string, patch: { name?: string; updatedAt?: number; cover?: string }) =>
+    ipcRenderer.invoke('projects:patchMeta', { id, patch }),
   deleteProject: (id: string) => ipcRenderer.invoke('projects:delete', id),
   loadProjectOrder: () => ipcRenderer.invoke('projects:loadOrder') as Promise<string[]>,
   saveProjectOrder: (ids: string[]) => ipcRenderer.invoke('projects:saveOrder', ids),

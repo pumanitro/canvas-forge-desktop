@@ -3,10 +3,35 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, unlink
 import { join } from 'path'
 
 // Real files on disk under the app's userData dir:
-//   Projects/<id>.json   one file per project (self-contained, with embedded images)
-//   projectOrder.json    sidebar order, as a bare list of project ids
-//   prompts.json         recent prompt history
-//   settings.json        { geminiKey }
+//   Projects/<id>.json        one file per project (self-contained, with embedded images)
+//   Projects/<id>.meta.json   the same project's summary: name, dates, image count, cover
+//   projectOrder.json         sidebar order, as a bare list of project ids
+//   prompts.json              recent prompt history
+//   settings.json             { geminiKey }
+//
+// A project JSON embeds every image as a base64 data URL and runs to hundreds of
+// megabytes. The sidebar only needs a name and a thumbnail per project, so it reads
+// the meta sidecars — a few KB each — and the full JSON is parsed only for the
+// project actually being opened. Loading every JSON at startup, as this used to,
+// put 1.3 GB of strings into the renderer before the first frame.
+
+export type ProjectMeta = {
+  id: string
+  name: string
+  createdAt: number
+  updatedAt: number
+  imageCount: number
+  /** Small WebP data URL of the project's mini-map, painted by the renderer. */
+  cover?: string
+}
+
+type StoredProject = {
+  id: string
+  name?: string
+  images?: unknown[]
+  createdAt?: number
+  updatedAt?: number
+}
 
 function projectsDir(): string {
   const d = join(app.getPath('userData'), 'Projects')
@@ -14,27 +39,103 @@ function projectsDir(): string {
   return d
 }
 
-export function loadProjects(): unknown[] {
+function jsonPath(id: string): string {
+  return join(projectsDir(), `${id}.json`)
+}
+function metaPath(id: string): string {
+  return join(projectsDir(), `${id}.meta.json`)
+}
+
+function readMeta(id: string): ProjectMeta | null {
+  try {
+    const m = JSON.parse(readFileSync(metaPath(id), 'utf8')) as ProjectMeta
+    return m && m.id === id ? m : null
+  } catch {
+    return null
+  }
+}
+
+function writeMeta(m: ProjectMeta): void {
+  writeFileSync(metaPath(m.id), JSON.stringify(m))
+}
+
+function metaOf(p: StoredProject, cover?: string): ProjectMeta {
+  return {
+    id: p.id,
+    name: p.name || 'Untitled',
+    createdAt: p.createdAt || 0,
+    updatedAt: p.updatedAt || 0,
+    imageCount: Array.isArray(p.images) ? p.images.length : 0,
+    cover
+  }
+}
+
+/** Every project's summary. A project that has no sidecar yet (written by an
+ *  older build) gets parsed once here and its sidecar created — the same cost
+ *  the old code paid on every launch, paid one last time. */
+export function loadProjects(): ProjectMeta[] {
   const dir = projectsDir()
-  const out: unknown[] = []
+  const out: ProjectMeta[] = []
   for (const f of readdirSync(dir)) {
-    if (!f.endsWith('.json')) continue
+    if (!f.endsWith('.json') || f.endsWith('.meta.json')) continue
+    const id = f.slice(0, -'.json'.length)
+    const meta = readMeta(id)
+    if (meta) {
+      out.push(meta)
+      continue
+    }
     try {
-      out.push(JSON.parse(readFileSync(join(dir, f), 'utf8')))
+      const p = JSON.parse(readFileSync(join(dir, f), 'utf8')) as StoredProject
+      const m = metaOf(p)
+      writeMeta(m)
+      out.push(m)
     } catch {
       /* skip corrupt */
     }
   }
-  return out.sort((a, b) => ((b as { updatedAt?: number }).updatedAt || 0) - ((a as { updatedAt?: number }).updatedAt || 0))
+  return out.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
 }
 
-export function saveProject(p: { id: string }): void {
-  writeFileSync(join(projectsDir(), `${p.id}.json`), JSON.stringify(p))
+/** The full project, images and all. Name and dates come from the sidecar when
+ *  it has one: a rename only rewrites the sidecar, not the multi-hundred-MB JSON. */
+export function loadProject(id: string): unknown | null {
+  try {
+    const p = JSON.parse(readFileSync(jsonPath(id), 'utf8')) as StoredProject
+    const m = readMeta(id)
+    if (m) {
+      p.name = m.name
+      p.updatedAt = m.updatedAt
+    }
+    return p
+  } catch {
+    return null
+  }
+}
+
+export function saveProject(p: StoredProject): void {
+  writeFileSync(jsonPath(p.id), JSON.stringify(p))
+  // Keep whatever cover the renderer last painted; it sends a fresh one separately.
+  writeMeta(metaOf(p, readMeta(p.id)?.cover))
+}
+
+/** Update summary fields without touching the project JSON. */
+export function patchProjectMeta(id: string, patch: Partial<Pick<ProjectMeta, 'name' | 'updatedAt' | 'cover'>>): ProjectMeta | null {
+  let m = readMeta(id)
+  if (!m) {
+    // No sidecar yet (or it was deleted by hand): rebuild it from the JSON first.
+    try {
+      m = metaOf(JSON.parse(readFileSync(jsonPath(id), 'utf8')) as StoredProject)
+    } catch {
+      return null
+    }
+  }
+  const next = { ...m, ...patch }
+  writeMeta(next)
+  return next
 }
 
 export function deleteProject(id: string): void {
-  const f = join(projectsDir(), `${id}.json`)
-  if (existsSync(f)) unlinkSync(f)
+  for (const f of [jsonPath(id), metaPath(id)]) if (existsSync(f)) unlinkSync(f)
 }
 
 // The sidebar order lives in its own file rather than as a field on each project:

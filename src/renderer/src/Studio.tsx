@@ -2,65 +2,86 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import Canvas from './Canvas'
 import McpPanel from './McpPanel'
-import type { ImageNode, Project } from './types'
-import { loadProjects, removeProject, saveProject, saveProjectOrder } from './store'
+import type { ImageNode, Project, ProjectSummary } from './types'
+import { loadProject, loadProjects, patchProjectMeta, removeProject, saveProject, saveProjectOrder } from './store'
 import { awaitProject, registerBridge } from './mcpBridge'
+import { COVER_H, COVER_W, renderCover } from './cover'
 import { uid } from './util'
 
-const THUMB_W = 186
-const THUMB_H = 104
+const THUMB_W = COVER_W
+const THUMB_H = COVER_H
 
 function makeProject(name: string): Project {
   const t = Date.now()
   return { id: uid(), name, images: [], createdAt: t, updatedAt: t }
 }
 
-function ProjectThumb({ images }: { images: ImageNode[] }) {
-  if (!images.length) return <div className="thumb empty">Empty</div>
-  const minX = Math.min(...images.map((n) => n.x))
-  const minY = Math.min(...images.map((n) => n.y))
-  const maxX = Math.max(...images.map((n) => n.x + n.w))
-  const maxY = Math.max(...images.map((n) => n.y + n.h))
-  const bw = maxX - minX || 1
-  const bh = maxY - minY || 1
-  const pad = 8
-  const s = Math.min((THUMB_W - 2 * pad) / bw, (THUMB_H - 2 * pad) / bh)
-  const offX = (THUMB_W - bw * s) / 2 - minX * s
-  const offY = (THUMB_H - bh * s) / 2 - minY * s
+/** A project card: one small pre-painted cover (see cover.ts), not the project's
+ *  images. The sidebar no longer holds any project but the open one. */
+function ProjectThumb({ summary }: { summary: ProjectSummary }): React.JSX.Element {
+  if (!summary.imageCount) return <div className="thumb empty">Empty</div>
+  if (!summary.cover) {
+    // A project saved by an older build has no cover yet; it gets one the first
+    // time it is opened.
+    return (
+      <div className="thumb empty">
+        {summary.imageCount} image{summary.imageCount === 1 ? '' : 's'}
+      </div>
+    )
+  }
   return (
     <div className="thumb" style={{ width: THUMB_W, height: THUMB_H }}>
-      {images.map((n) => (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img
-          key={n.id}
-          src={n.src}
-          alt=""
-          draggable={false}
-          style={{ position: 'absolute', left: n.x * s + offX, top: n.y * s + offY, width: n.w * s, height: n.h * s }}
-        />
-      ))}
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={summary.cover}
+        alt=""
+        draggable={false}
+        decoding="async"
+        style={{ position: 'absolute', left: 0, top: 0, width: THUMB_W, height: THUMB_H }}
+      />
     </div>
   )
 }
 
 export default function Studio() {
-  const [projects, setProjects] = useState<Project[]>([])
+  // The sidebar holds summaries only. The one project that is open is `current`,
+  // loaded from disk when it is selected — nothing else's images are in memory.
+  const [projects, setProjects] = useState<ProjectSummary[]>([])
   const [currentId, setCurrentId] = useState<string | null>(null)
+  const [current, setCurrent] = useState<Project | null>(null)
   const [ready, setReady] = useState(false)
   const [editingName, setEditingName] = useState<string | null>(null)
   const [toast, setToast] = useState<string | null>(null)
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const coverTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // latest values for the global Cmd+S listener (avoids re-registering on every change)
-  const projectsRef = useRef<Project[]>([])
+  const projectsRef = useRef<ProjectSummary[]>([])
   const currentIdRef = useRef<string | null>(null)
+  const currentRef = useRef<Project | null>(null)
+  // Set by every real edit, cleared by every save. Opening a project must not
+  // count: it would push the whole multi-hundred-MB JSON back through IPC and
+  // rewrite it unchanged, 350 ms after it was read.
+  const dirtyRef = useRef(false)
   useEffect(() => {
     projectsRef.current = projects
   }, [projects])
   useEffect(() => {
     currentIdRef.current = currentId
   }, [currentId])
+  useEffect(() => {
+    currentRef.current = current
+  }, [current])
+
+  /** Reflect a full project's name/count/date back onto its sidebar summary. */
+  const syncSummary = useCallback((p: Project, extra?: Partial<ProjectSummary>) => {
+    setProjects((prev) =>
+      prev.map((s) =>
+        s.id === p.id ? { ...s, name: p.name, updatedAt: p.updatedAt, imageCount: p.images.length, ...extra } : s
+      )
+    )
+  }, [])
 
   useEffect(() => {
     let alive = true
@@ -69,7 +90,8 @@ export default function Studio() {
       if (ps.length === 0) {
         const p = makeProject('Untitled')
         saveProject(p)
-        ps = [p]
+        setCurrent(p)
+        ps = [{ id: p.id, name: p.name, createdAt: p.createdAt, updatedAt: p.updatedAt, imageCount: 0 }]
       }
       setProjects(ps)
       setCurrentId(ps[0].id)
@@ -80,7 +102,36 @@ export default function Studio() {
     }
   }, [])
 
-  const current = projects.find((p) => p.id === currentId) || null
+  // Selecting a card loads that project. Guarded so a slow load of project A
+  // cannot land after the user has already clicked project B.
+  const loadSeq = useRef(0)
+  useEffect(() => {
+    if (!currentId) return
+    if (currentRef.current?.id === currentId) return // already have it (just created / imported)
+    const seq = ++loadSeq.current
+    // Flush any unsaved edits to the project we are leaving before it unmounts.
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current)
+      saveTimer.current = null
+    }
+    if (coverTimer.current) {
+      clearTimeout(coverTimer.current)
+      coverTimer.current = null
+    }
+    const leaving = currentRef.current
+    if (leaving && dirtyRef.current) {
+      void saveProject(leaving)
+      syncSummary(leaving)
+    }
+    dirtyRef.current = false
+    setCurrent(null)
+    loadProject(currentId).then((p) => {
+      if (seq !== loadSeq.current) return
+      if (!p) return
+      setCurrent(p)
+      syncSummary(p)
+    })
+  }, [currentId, syncSummary])
 
   const flashToast = useCallback((msg: string) => {
     setToast(msg)
@@ -88,20 +139,44 @@ export default function Studio() {
     toastTimer.current = setTimeout(() => setToast(null), 1600)
   }, [])
 
-  // Debounced auto-save of the current project.
+  // Debounced auto-save of the current project, and — on a slower clock, because
+  // it decodes images — a fresh cover for its sidebar card.
   useEffect(() => {
     if (!ready || !current) return
-    if (saveTimer.current) clearTimeout(saveTimer.current)
     const p = current
-    saveTimer.current = setTimeout(() => saveProject(p), 350)
-  }, [current, ready])
+    const dirty = dirtyRef.current
+    if (dirty) {
+      if (saveTimer.current) clearTimeout(saveTimer.current)
+      saveTimer.current = setTimeout(() => {
+        saveTimer.current = null
+        dirtyRef.current = false
+        void saveProject(p)
+        syncSummary(p)
+      }, 350)
+    }
+    // A project saved by an older build arrives without a cover: paint one on
+    // first open even though nothing changed.
+    const needsCover = !projectsRef.current.find((s) => s.id === p.id)?.cover
+    if (dirty || needsCover) {
+      if (coverTimer.current) clearTimeout(coverTimer.current)
+      coverTimer.current = setTimeout(() => {
+        coverTimer.current = null
+        void renderCover(p.images).then((cover) => {
+          if (!cover) return
+          if (currentRef.current?.id !== p.id) return // moved on; that project will get its own
+          void patchProjectMeta(p.id, { cover })
+          setProjects((prev) => prev.map((s) => (s.id === p.id ? { ...s, cover } : s)))
+        })
+      }, 1500)
+    }
+  }, [current, ready, syncSummary])
 
   // Cmd/Ctrl+S → save into the project (NOT the browser "save page to Desktop").
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
         e.preventDefault()
-        const cur = projectsRef.current.find((p) => p.id === currentIdRef.current)
+        const cur = currentRef.current
         if (cur) {
           if (saveTimer.current) clearTimeout(saveTimer.current)
           saveProject(cur)
@@ -144,7 +219,7 @@ export default function Studio() {
           projects: projectsRef.current.map((p) => ({
             id: p.id,
             name: p.name,
-            images: p.images.length,
+            images: p.imageCount,
             open: p.id === currentIdRef.current,
             updatedAt: new Date(p.updatedAt).toISOString()
           }))
@@ -168,27 +243,23 @@ export default function Studio() {
         const live = await awaitProject(target.id)
         return {
           text:
-            `Opened "${target.name}" — ${target.images.length} image(s) on the canvas.` +
-            (live ? '' : ' (the canvas is still mounting — re-check with get_state)'),
-          json: { id: target.id, name: target.name, images: target.images.length }
+            `Opened "${target.name}" — ${target.imageCount} image(s) on the canvas.` +
+            (live ? '' : ' (the canvas is still loading — re-check with get_state)'),
+          json: { id: target.id, name: target.name, images: target.imageCount }
         }
       }
     })
   , [])
 
-  const handleImagesChange = useCallback(
-    (images: ImageNode[]) => {
-      setProjects((prev) =>
-        prev.map((p) => (p.id === currentId ? { ...p, images, updatedAt: Date.now() } : p))
-      )
-    },
-    [currentId]
-  )
+  const handleImagesChange = useCallback((images: ImageNode[]) => {
+    dirtyRef.current = true
+    setCurrent((prev) => (prev ? { ...prev, images, updatedAt: Date.now() } : prev))
+  }, [])
 
   // The sidebar order is persisted as a bare id list (see main/store.ts). Re-commit it
   // on every structural change so the visible order always survives a restart — without
   // this, only reordered projects would be ranked and new ones would jump to the bottom.
-  const commitOrder = useCallback((list: Project[]): void => {
+  const commitOrder = useCallback((list: ProjectSummary[]): void => {
     saveProjectOrder(list.map((p) => p.id))
   }, [])
 
@@ -340,39 +411,63 @@ export default function Studio() {
     }
   }, [commitOrder])
 
+  const summaryOf = (p: Project, cover?: string): ProjectSummary => ({
+    id: p.id,
+    name: p.name,
+    createdAt: p.createdAt,
+    updatedAt: p.updatedAt,
+    imageCount: p.images.length,
+    cover
+  })
+
+  /** Make a project we already hold in full the open one, without a disk round-trip. */
+  const openLoaded = (p: Project): void => {
+    loadSeq.current++ // cancel any load in flight for a previous selection
+    setCurrent(p)
+    setCurrentId(p.id)
+  }
+
   const createProject = () => {
     const p = makeProject('Untitled')
-    const next = [p, ...projects]
+    const next = [summaryOf(p), ...projects]
     setProjects(next)
     commitOrder(next)
-    setCurrentId(p.id)
+    openLoaded(p)
     saveProject(p)
     setEditingName(p.id)
   }
 
   const renameProject = (id: string, name: string) => {
     const clean = name.trim() || 'Untitled'
-    setProjects((prev) => {
-      const next = prev.map((p) => (p.id === id ? { ...p, name: clean } : p))
-      const p = next.find((x) => x.id === id)
-      if (p) saveProject(p)
-      return next
-    })
+    setProjects((prev) => prev.map((p) => (p.id === id ? { ...p, name: clean } : p)))
+    if (currentRef.current?.id === id) {
+      // The open project saves itself (debounced) and carries the name into its JSON.
+      dirtyRef.current = true
+      setCurrent((prev) => (prev ? { ...prev, name: clean } : prev))
+    } else {
+      // A closed project is not in memory; its name lives in the sidecar until it is
+      // next opened, when loadProject overlays it — no need to rewrite a huge JSON.
+      void patchProjectMeta(id, { name: clean })
+    }
   }
 
   const deleteProject = (id: string) => {
     const p = projects.find((x) => x.id === id)
-    if (p && p.images.length > 0 && !confirm(`Delete "${p.name}"? This can't be undone.`)) return
+    if (p && p.imageCount > 0 && !confirm(`Delete "${p.name}"? This can't be undone.`)) return
     removeProject(id)
     let next = projects.filter((x) => x.id !== id)
+    let fresh: Project | null = null
     if (!next.length) {
-      const np = makeProject('Untitled')
-      saveProject(np)
-      next = [np]
+      fresh = makeProject('Untitled')
+      saveProject(fresh)
+      next = [summaryOf(fresh)]
     }
-    if (id === currentId) setCurrentId(next[0].id)
     setProjects(next)
     commitOrder(next)
+    if (id === currentId) {
+      if (fresh) openLoaded(fresh)
+      else setCurrentId(next[0].id)
+    }
   }
 
   const importProject = async () => {
@@ -385,14 +480,20 @@ export default function Studio() {
     let p = r.project as Project
     if (projects.some((x) => x.id === p.id)) p = { ...p, id: uid(), name: `${p.name || 'Untitled'} (imported)` }
     await saveProject(p)
-    const next = [p, ...projects.filter((x) => x.id !== p.id)]
+    const next = [summaryOf(p), ...projects.filter((x) => x.id !== p.id)]
     setProjects(next)
     commitOrder(next)
-    setCurrentId(p.id)
+    openLoaded(p)
     flashToast(`Imported “${p.name}”`)
   }
 
-  const exportProject = async (p: Project) => {
+  const exportProject = async (s: ProjectSummary) => {
+    // Only the open project is in memory; anything else is read from disk for the export.
+    const p = currentRef.current?.id === s.id ? currentRef.current : await loadProject(s.id)
+    if (!p) {
+      flashToast('Could not read that project')
+      return
+    }
     const r = await window.api.exportProject(p)
     if (r?.path) flashToast('Exported to file')
   }
@@ -428,7 +529,7 @@ export default function Studio() {
               }}
               onDoubleClick={() => setEditingName(p.id)}
             >
-              <ProjectThumb images={p.images} />
+              <ProjectThumb summary={p} />
               <div className="proj-foot">
                 {editingName === p.id ? (
                   <input
