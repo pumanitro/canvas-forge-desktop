@@ -37,7 +37,8 @@ if (process.env.CANVAS_FORGE_USER_DATA) {
 // DEV ONLY: expose a Chrome DevTools Protocol endpoint so the app can be driven /
 // inspected/tested over CDP (like a browser tab). Never enabled in a packaged build.
 if (!app.isPackaged) {
-  app.commandLine.appendSwitch('remote-debugging-port', process.env.CANVAS_FORGE_DEBUG_PORT || '9333')
+  const debugPort = process.env.CANVAS_FORGE_DEBUG_PORT || '9333'
+  app.commandLine.appendSwitch('remote-debugging-port', debugPort)
   app.commandLine.appendSwitch('remote-allow-origins', '*')
 }
 

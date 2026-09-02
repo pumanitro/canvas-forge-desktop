@@ -423,6 +423,13 @@ async function ingestScanned(
     const nid = isSafeId(n.id) && !seen.has(n.id) ? n.id : uid()
     seen.add(nid)
     const node: StoredNode = { ...rest, id: nid }
+    // Files written by other tools have carried coordinates as strings, and a
+    // string x makes `n.x + n.w` concatenate downstream ("12300" + 480 → 12300480).
+    for (const k of ['x', 'y', 'w', 'h', 'nW', 'nH'] as const) {
+      const v = node[k] as unknown
+      if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)))
+        node[k] = Number(v)
+    }
     const r = scanned.srcs[i]
     const dec = r ? decodeDataUrlRange(buf, r) : null
     if (dec && dec.bytes.length) {
