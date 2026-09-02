@@ -1,19 +1,53 @@
 import { app } from 'electron'
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, unlinkSync } from 'fs'
+import {
+  closeSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync
+} from 'fs'
 import { join } from 'path'
+import {
+  decodeDataUrl,
+  decodeDataUrlRange,
+  scanLegacyProject,
+  type ScannedProject
+} from './legacyScan'
 
 // Real files on disk under the app's userData dir:
-//   Projects/<id>.json        one file per project (self-contained, with embedded images)
-//   Projects/<id>.meta.json   the same project's summary: name, dates, image count, cover
-//   projectOrder.json         sidebar order, as a bare list of project ids
-//   prompts.json              recent prompt history
-//   settings.json             { geminiKey }
+//   Projects/<id>/project.json              layout + metadata for every image — NO pixels
+//   Projects/<id>/img/<nodeId>.<png|jpg…>   each image's original bytes, written once
+//   Projects/<id>/lod/<nodeId>.<160|512|1280>.png
+//                                           downscaled tiers, made lazily by the cf-img
+//                                           protocol handler (see pixels.ts), never by hand
+//   Projects/<id>.meta.json                 the project's summary: name, dates, count, cover
+//   Projects/<id>.legacy.json               the pre-split single-file project, kept as a backup
+//   projectOrder.json                       sidebar order, as a bare list of project ids
+//   prompts.json                            recent prompt history
+//   settings.json                           { geminiKey }
 //
-// A project JSON embeds every image as a base64 data URL and runs to hundreds of
-// megabytes. The sidebar only needs a name and a thumbnail per project, so it reads
-// the meta sidecars — a few KB each — and the full JSON is parsed only for the
-// project actually being opened. Loading every JSON at startup, as this used to,
-// put 1.3 GB of strings into the renderer before the first frame.
+// Pixels live OUTSIDE the document, the way Figma keeps them: a node in
+// project.json is a few hundred bytes and its `src`, as the renderer sees it,
+// is a `cf-img://<projectId>/<nodeId>/full` URL that Chromium fetches — at the
+// tier it needs — only when the node is actually painted. Before this split a
+// project was ONE JSON with every image inlined as base64, and the owner's real
+// projects ran to 500+ MB: opening one meant parsing half a gigabyte in main,
+// structured-cloning it to the renderer and holding it in React state (three
+// copies), and every edit sent the whole thing back to be rewritten in full.
+// Past 512 MiB V8 cannot even make the string, so the project stopped opening
+// and saving at all. Now an open reads KB, a save writes KB, and the renderer
+// never holds an image it is not looking at.
+//
+// A legacy `Projects/<id>.json` is migrated the first time it is opened (see
+// migrateLegacy) and renamed to `<id>.legacy.json`; it is never deleted.
 
 export type ProjectMeta = {
   id: string
@@ -25,26 +59,185 @@ export type ProjectMeta = {
   cover?: string
 }
 
+/** A node as written to project.json: everything but the pixels. */
+type StoredNode = {
+  id: string
+  x: number
+  y: number
+  w: number
+  h: number
+  nW: number
+  nH: number
+  prompt?: string
+  model?: string
+  createdAt?: number
+  transparent?: boolean
+  name?: string
+  hidden?: boolean
+  /** Extension of img/<id>.<img>. Absent when the node has no pixels on disk. */
+  img?: string
+  /** Bumped when the pixels are replaced in place. Rides in the URL as ?v= so
+   *  Chromium's cache cannot keep painting the old bytes. */
+  v?: number
+}
+
 type StoredProject = {
   id: string
   name?: string
-  images?: unknown[]
+  images?: StoredNode[]
   createdAt?: number
   updatedAt?: number
 }
+
+/** A node as the renderer sees it: `src` is a cf-img URL for anything on disk,
+ *  or a data URL for pixels it has not saved yet. */
+export type LiveNode = Omit<StoredNode, 'img' | 'v'> & { src: string }
+export type LiveProject = Omit<StoredProject, 'images'> & { images?: LiveNode[] }
+
+export const IMG_SCHEME = 'cf-img'
+/** Longest-edge sizes the protocol handler serves proxies at. Mirrors lod.ts. */
+export const TIERS = [160, 512, 1280] as const
+
+const EXT_BY_MIME: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+  'image/bmp': 'bmp',
+  'image/avif': 'avif'
+}
+export const MIME_BY_EXT: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  bmp: 'image/bmp',
+  avif: 'image/avif'
+}
+const EXTS = Object.keys(MIME_BY_EXT)
+
+// A project id is the HOST of its cf-img URLs, and hosts are case-folded by the
+// URL parser; a node id is a path segment and a file name. Both are generated by
+// uid() (lowercase base36) in practice — this just keeps a hand-edited or
+// imported file from producing "../" or an id the URL cannot carry.
+const SAFE_PROJECT_ID = /^[a-z0-9][a-z0-9_-]{0,80}$/
+const SAFE_NODE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,80}$/
+
+export function isSafeId(id: unknown, project = false): id is string {
+  return typeof id === 'string' && (project ? SAFE_PROJECT_ID : SAFE_NODE_ID).test(id)
+}
+
+/** Same shape as the renderer's uid(). */
+function uid(): string {
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36)
+}
+
+export function imgUrl(
+  pid: string,
+  nid: string,
+  v?: number,
+  tier: string | number = 'full'
+): string {
+  return `${IMG_SCHEME}://${pid}/${nid}/${tier}${v ? `?v=${v}` : ''}`
+}
+
+export function parseImgUrl(
+  src: string
+): { pid: string; nid: string; tier: string; v: number } | null {
+  if (!src.startsWith(`${IMG_SCHEME}://`)) return null
+  try {
+    const u = new URL(src)
+    const [nid, tier] = u.pathname.split('/').filter(Boolean)
+    if (!isSafeId(u.hostname, true) || !isSafeId(nid) || !tier) return null
+    return { pid: u.hostname, nid, tier, v: Number(u.searchParams.get('v')) || 0 }
+  } catch {
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------
+// paths
+// ---------------------------------------------------------------------------
 
 function projectsDir(): string {
   const d = join(app.getPath('userData'), 'Projects')
   if (!existsSync(d)) mkdirSync(d, { recursive: true })
   return d
 }
-
-function jsonPath(id: string): string {
+function projectDir(id: string): string {
+  return join(projectsDir(), id)
+}
+function projectJsonPath(id: string): string {
+  return join(projectDir(id), 'project.json')
+}
+export function imgDir(id: string): string {
+  return join(projectDir(id), 'img')
+}
+export function lodDir(id: string): string {
+  return join(projectDir(id), 'lod')
+}
+function legacyPath(id: string): string {
   return join(projectsDir(), `${id}.json`)
+}
+function legacyBackupPath(id: string): string {
+  return join(projectsDir(), `${id}.legacy.json`)
 }
 function metaPath(id: string): string {
   return join(projectsDir(), `${id}.meta.json`)
 }
+
+/** The original bytes of one node, if they are on disk. `ext` skips the probe. */
+export function imgFileFor(pid: string, nid: string, ext?: string): string | null {
+  if (!isSafeId(pid, true) || !isSafeId(nid)) return null
+  const d = imgDir(pid)
+  if (ext) {
+    const f = join(d, `${nid}.${ext}`)
+    return existsSync(f) ? f : null
+  }
+  for (const e of EXTS) {
+    const f = join(d, `${nid}.${e}`)
+    if (existsSync(f)) return f
+  }
+  return null
+}
+
+/** Where a tier of one node lives. A tier is a JPEG when the image is opaque,
+ *  a PNG when it has alpha (see pixels.ts). */
+export function lodPath(pid: string, nid: string, tier: number, ext: 'png' | 'jpg'): string {
+  return join(lodDir(pid), `${nid}.${tier}.${ext}`)
+}
+
+/** The tier file that exists for one node, if any. */
+export function lodFileFor(pid: string, nid: string, tier: number): string | null {
+  for (const ext of ['jpg', 'png'] as const) {
+    const f = lodPath(pid, nid, tier, ext)
+    if (existsSync(f)) return f
+  }
+  return null
+}
+
+export function extOf(file: string): string {
+  return file.slice(file.lastIndexOf('.') + 1).toLowerCase()
+}
+
+function dropImg(pid: string, nid: string): void {
+  for (const e of EXTS) {
+    const f = join(imgDir(pid), `${nid}.${e}`)
+    if (existsSync(f)) unlinkSync(f)
+  }
+}
+
+export function dropTiers(pid: string, nid: string): void {
+  for (const t of TIERS) {
+    const f = lodFileFor(pid, nid, t)
+    if (f) unlinkSync(f)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// meta sidecars
+// ---------------------------------------------------------------------------
 
 function readMeta(id: string): ProjectMeta | null {
   try {
@@ -70,78 +263,421 @@ function metaOf(p: StoredProject, cover?: string): ProjectMeta {
   }
 }
 
-/** Every project's summary. A project that has no sidecar yet (written by an
- *  older build) gets parsed once here and its sidecar created — the same cost
- *  the old code paid on every launch, paid one last time. */
-export function loadProjects(): ProjectMeta[] {
-  const dir = projectsDir()
-  const out: ProjectMeta[] = []
-  for (const f of readdirSync(dir)) {
-    if (!f.endsWith('.json') || f.endsWith('.meta.json')) continue
-    const id = f.slice(0, -'.json'.length)
-    const meta = readMeta(id)
-    if (meta) {
-      out.push(meta)
-      continue
-    }
-    try {
-      const p = JSON.parse(readFileSync(join(dir, f), 'utf8')) as StoredProject
-      const m = metaOf(p)
-      writeMeta(m)
-      out.push(m)
-    } catch {
-      /* skip corrupt */
-    }
-  }
-  return out.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
-}
+// ---------------------------------------------------------------------------
+// project.json
+// ---------------------------------------------------------------------------
 
-/** The full project, images and all. Name and dates come from the sidecar when
- *  it has one: a rename only rewrites the sidecar, not the multi-hundred-MB JSON. */
-export function loadProject(id: string): unknown | null {
+function readStored(id: string): StoredProject | null {
   try {
-    const p = JSON.parse(readFileSync(jsonPath(id), 'utf8')) as StoredProject
-    const m = readMeta(id)
-    if (m) {
-      p.name = m.name
-      p.updatedAt = m.updatedAt
-    }
+    const p = JSON.parse(readFileSync(projectJsonPath(id), 'utf8')) as StoredProject
+    if (!p || typeof p !== 'object') return null
+    p.id = id
+    if (!Array.isArray(p.images)) p.images = []
     return p
   } catch {
     return null
   }
 }
 
-export function saveProject(p: StoredProject): void {
-  writeFileSync(jsonPath(p.id), JSON.stringify(p))
-  // Keep whatever cover the renderer last painted; it sends a fresh one separately.
-  writeMeta(metaOf(p, readMeta(p.id)?.cover))
+function writeStored(p: StoredProject): void {
+  mkdirSync(projectDir(p.id), { recursive: true })
+  writeFileSync(projectJsonPath(p.id), JSON.stringify(p))
 }
 
-/** Update summary fields without touching the project JSON. */
-export function patchProjectMeta(id: string, patch: Partial<Pick<ProjectMeta, 'name' | 'updatedAt' | 'cover'>>): ProjectMeta | null {
+/** What the renderer gets: every stored node with its cf-img URL. */
+function toLive(p: StoredProject): LiveProject {
+  const images: LiveNode[] = []
+  for (const n of p.images ?? []) {
+    const { img, v, ...rest } = n
+    images.push({ ...rest, src: img ? imgUrl(p.id, n.id, v) : '' })
+  }
+  return { ...p, images }
+}
+
+/** A legacy single-file project's summary, without parsing its images. */
+function metaFromLegacy(id: string, file: string): ProjectMeta | null {
+  try {
+    const { slim } = scanLegacyProject(readFileSync(file))
+    const p = JSON.parse(slim) as StoredProject
+    p.id = id
+    return metaOf(p)
+  } catch {
+    return null
+  }
+}
+
+function metaFromDisk(id: string): ProjectMeta | null {
+  const stored = readStored(id)
+  if (stored) return metaOf(stored)
+  if (existsSync(legacyPath(id))) return metaFromLegacy(id, legacyPath(id))
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// listing
+// ---------------------------------------------------------------------------
+
+let gcDone = false
+
+/** Every project's summary. A project that has no sidecar yet gets one built
+ *  here — from the small project.json, or from a scan of a legacy file. */
+export function loadProjects(): ProjectMeta[] {
+  const dir = projectsDir()
+  const ids = new Set<string>()
+  for (const f of readdirSync(dir, { withFileTypes: true })) {
+    if (f.isDirectory()) {
+      if (existsSync(join(dir, f.name, 'project.json'))) ids.add(f.name)
+      continue
+    }
+    if (!f.isFile() || !f.name.endsWith('.json')) continue
+    if (f.name.endsWith('.meta.json') || f.name.endsWith('.legacy.json')) continue
+    ids.add(f.name.slice(0, -'.json'.length))
+  }
+  const out: ProjectMeta[] = []
+  for (const id of ids) {
+    let m = readMeta(id)
+    if (!m) {
+      m = metaFromDisk(id)
+      if (m) writeMeta(m)
+    }
+    if (m) out.push(m)
+  }
+  if (!gcDone) {
+    gcDone = true
+    collectOrphans()
+  }
+  return out.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+}
+
+/** Delete img/ and lod/ files for nodes that no project.json references.
+ *
+ *  Deliberately NOT done at save time: the app promises Cmd+Z after a delete,
+ *  and the undo stack now holds cf-img URLs rather than pixels — dropping the
+ *  file the moment the node leaves the project would make undo restore a
+ *  broken image. The undo stack does not survive a restart, so the next launch
+ *  is the first moment the bytes are genuinely unreachable. */
+function collectOrphans(): void {
+  const dir = projectsDir()
+  for (const f of readdirSync(dir, { withFileTypes: true })) {
+    if (!f.isDirectory()) continue
+    const p = readStored(f.name)
+    if (!p) continue
+    const live = new Set((p.images ?? []).map((n) => n.id))
+    for (const sub of [imgDir(p.id), lodDir(p.id)]) {
+      if (!existsSync(sub)) continue
+      for (const file of readdirSync(sub)) {
+        const nid = file.slice(0, file.indexOf('.'))
+        if (nid && !live.has(nid)) {
+          try {
+            unlinkSync(join(sub, file))
+          } catch {
+            /* next launch */
+          }
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// loading + one-time migration
+// ---------------------------------------------------------------------------
+
+export type Progress = (done: number, total: number) => void
+
+const yieldToLoop = (): Promise<void> => new Promise((r) => setImmediate(r))
+
+/** Write a scanned legacy project into the split layout under `id`. Shared by
+ *  the in-place migration and by import. */
+async function ingestScanned(
+  buf: Buffer,
+  scanned: ScannedProject,
+  id: string,
+  override: { name?: string } = {},
+  onProgress?: Progress
+): Promise<StoredProject> {
+  const raw = JSON.parse(scanned.slim) as StoredProject & {
+    images?: (StoredNode & { src?: string })[]
+  }
+  const p: StoredProject = {
+    id,
+    name: override.name ?? raw.name,
+    createdAt: raw.createdAt,
+    updatedAt: raw.updatedAt,
+    images: []
+  }
+  const dir = imgDir(id)
+  mkdirSync(dir, { recursive: true })
+  // A fresh ingest of a node id invalidates anything cached for it.
+  if (existsSync(lodDir(id))) rmSync(lodDir(id), { recursive: true, force: true })
+  const seen = new Set<string>()
+  const list = Array.isArray(raw.images) ? raw.images : []
+  const total = list.length
+  for (let i = 0; i < total; i++) {
+    const n = list[i]
+    if (!n || typeof n !== 'object') continue
+    const { src: _src, img: _img, v: _v, ...rest } = n
+    void _src
+    void _img
+    void _v
+    const nid = isSafeId(n.id) && !seen.has(n.id) ? n.id : uid()
+    seen.add(nid)
+    const node: StoredNode = { ...rest, id: nid }
+    const r = scanned.srcs[i]
+    const dec = r ? decodeDataUrlRange(buf, r) : null
+    if (dec && dec.bytes.length) {
+      const ext = EXT_BY_MIME[dec.mime] ?? 'png'
+      dropImg(id, nid)
+      writeFileSync(join(dir, `${nid}.${ext}`), dec.bytes)
+      node.img = ext
+    }
+    p.images!.push(node)
+    if (i % 8 === 7 || i === total - 1) {
+      onProgress?.(i + 1, total)
+      await yieldToLoop()
+    }
+  }
+  // project.json goes last: its existence is what marks the ingest complete.
+  writeStored(p)
+  writeMeta(metaOf(p, readMeta(id)?.cover))
+  return p
+}
+
+/** Split `Projects/<id>.json` into the new layout, then rename it to
+ *  `<id>.legacy.json`. Costs one read of the file and one write of its images;
+ *  the owner's 522 MB project takes a few seconds, once. */
+async function migrateLegacy(id: string, onProgress?: Progress): Promise<void> {
+  const src = legacyPath(id)
+  const t0 = Date.now()
+  const buf = readFileSync(src)
+  const scanned = scanLegacyProject(buf)
+  await ingestScanned(buf, scanned, id, {}, onProgress)
+  backupLegacy(id)
+  console.log(
+    `[store] migrated ${id}: ${(buf.length / 1e6).toFixed(0)} MB in ${Date.now() - t0} ms`
+  )
+}
+
+/** Move the single-file original aside. Never deletes it. */
+function backupLegacy(id: string): void {
+  const src = legacyPath(id)
+  if (!existsSync(src)) return
+  let dst = legacyBackupPath(id)
+  let n = 2
+  while (existsSync(dst)) dst = join(projectsDir(), `${id}.legacy-${n++}.json`)
+  renameSync(src, dst)
+}
+
+/** The project as the renderer needs it: layout only, `src` as cf-img URLs.
+ *  Name and dates come from the sidecar when it has one. */
+export async function loadProject(id: string, onProgress?: Progress): Promise<LiveProject | null> {
+  if (!isSafeId(id, true)) return null
+  try {
+    if (!existsSync(projectJsonPath(id))) {
+      if (!existsSync(legacyPath(id))) return null
+      await migrateLegacy(id, onProgress)
+    } else if (existsSync(legacyPath(id))) {
+      // A migration that wrote project.json but did not get to the rename.
+      backupLegacy(id)
+    }
+    const p = readStored(id)
+    if (!p) return null
+    const m = readMeta(id)
+    if (m) {
+      p.name = m.name
+      p.updatedAt = m.updatedAt
+    }
+    return toLive(p)
+  } catch (e) {
+    console.error('[store] loadProject failed:', e instanceof Error ? e.message : e)
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------
+// saving
+// ---------------------------------------------------------------------------
+
+function sameBytes(file: string, bytes: Buffer): boolean {
+  try {
+    return statSync(file).size === bytes.length && readFileSync(file).equals(bytes)
+  } catch {
+    return false
+  }
+}
+
+/** Persist a project. Any node whose `src` is still a data URL has its bytes
+ *  written to img/ and gets a cf-img URL back in `rewritten`, so the renderer
+ *  can let the base64 go. A node whose URL points at another node (a duplicate
+ *  or a paste from another project) gets its own copy of the bytes. Idempotent:
+ *  saving again with the same content writes only project.json. */
+export function saveProject(p: LiveProject): { rewritten: Record<string, string> } {
+  const pid = p.id
+  if (!isSafeId(pid, true)) throw new Error(`bad project id "${pid}"`)
+  const t0 = Date.now()
+  mkdirSync(imgDir(pid), { recursive: true })
+  const prev = readStored(pid)
+  const prevById = new Map((prev?.images ?? []).map((n) => [n.id, n] as const))
+  const rewritten: Record<string, string> = {}
+  const images: StoredNode[] = []
+  let wroteBytes = 0
+
+  for (const n of p.images ?? []) {
+    if (!n || typeof n !== 'object' || !isSafeId(n.id)) continue
+    const { src, ...rest } = n
+    const node: StoredNode = { ...rest }
+    const old = prevById.get(n.id)
+
+    if (typeof src === 'string' && src.startsWith('data:')) {
+      const dec = decodeDataUrl(src)
+      if (dec && dec.bytes.length) {
+        const ext = EXT_BY_MIME[dec.mime] ?? 'png'
+        const oldFile = old?.img ? join(imgDir(pid), `${n.id}.${old.img}`) : null
+        if (oldFile && old?.img === ext && sameBytes(oldFile, dec.bytes)) {
+          // The same pixels again (an undo landed on a pre-save snapshot): nothing to write.
+          node.img = old!.img
+          if (old!.v) node.v = old!.v
+        } else {
+          if (oldFile) {
+            dropImg(pid, n.id)
+            dropTiers(pid, n.id)
+            node.v = (old!.v ?? 0) + 1
+          }
+          writeFileSync(join(imgDir(pid), `${n.id}.${ext}`), dec.bytes)
+          wroteBytes += dec.bytes.length
+          node.img = ext
+        }
+        rewritten[n.id] = imgUrl(pid, n.id, node.v)
+      }
+    } else if (typeof src === 'string' && src.startsWith(`${IMG_SCHEME}://`)) {
+      const ref = parseImgUrl(src)
+      if (ref && ref.pid === pid && ref.nid === n.id) {
+        const ext = old?.img ?? (imgFileFor(pid, n.id) ? extOf(imgFileFor(pid, n.id)!) : undefined)
+        if (ext) node.img = ext
+        if (old?.v) node.v = old.v
+        else if (ref.v) node.v = ref.v
+      } else if (ref) {
+        // A copy of another node's pixels: give this node its own file.
+        const from = imgFileFor(ref.pid, ref.nid)
+        if (from) {
+          const ext = extOf(from)
+          dropImg(pid, n.id)
+          dropTiers(pid, n.id)
+          copyFileSync(from, join(imgDir(pid), `${n.id}.${ext}`))
+          for (const t of TIERS) {
+            const tier = lodFileFor(ref.pid, ref.nid, t)
+            if (tier) {
+              mkdirSync(lodDir(pid), { recursive: true })
+              copyFileSync(tier, lodPath(pid, n.id, t, extOf(tier) as 'png' | 'jpg'))
+            }
+          }
+          node.img = ext
+          rewritten[n.id] = imgUrl(pid, n.id)
+        }
+      }
+    }
+    images.push(node)
+  }
+
+  const stored: StoredProject = {
+    id: pid,
+    name: p.name,
+    images,
+    createdAt: p.createdAt,
+    updatedAt: p.updatedAt
+  }
+  writeStored(stored)
+  // Keep whatever cover the renderer last painted; it sends a fresh one separately.
+  writeMeta(metaOf(stored, readMeta(pid)?.cover))
+  console.log(
+    `[store] save ${pid}: ${images.length} nodes, ${Object.keys(rewritten).length} rewritten, ` +
+      `${(wroteBytes / 1e6).toFixed(1)} MB of pixels, project.json ${statSync(projectJsonPath(pid)).size} B, ${Date.now() - t0} ms`
+  )
+  return { rewritten }
+}
+
+/** Update summary fields without touching the project itself. */
+export function patchProjectMeta(
+  id: string,
+  patch: Partial<Pick<ProjectMeta, 'name' | 'updatedAt' | 'cover'>>
+): ProjectMeta | null {
   let m = readMeta(id)
   if (!m) {
-    // No sidecar yet (or it was deleted by hand): rebuild it from the JSON first.
-    try {
-      m = metaOf(JSON.parse(readFileSync(jsonPath(id), 'utf8')) as StoredProject)
-    } catch {
-      return null
-    }
+    // No sidecar yet (or it was deleted by hand): rebuild it from disk first.
+    m = metaFromDisk(id)
+    if (!m) return null
   }
   const next = { ...m, ...patch }
   writeMeta(next)
   return next
 }
 
+/** Removes the project and its images. The `.legacy.json` backup of a migrated
+ *  project is left alone — it is the one copy nothing else can rebuild. */
 export function deleteProject(id: string): void {
-  for (const f of [jsonPath(id), metaPath(id)]) if (existsSync(f)) unlinkSync(f)
+  if (!isSafeId(id, true)) return
+  if (existsSync(projectDir(id))) rmSync(projectDir(id), { recursive: true, force: true })
+  for (const f of [legacyPath(id), metaPath(id)]) if (existsSync(f)) unlinkSync(f)
 }
 
-// The sidebar order lives in its own file rather than as a field on each project:
-// project JSONs embed their images and run to megabytes, so rewriting every one of
-// them just to swap two cards would be absurd. This is a bare id list — ids that no
-// longer exist are ignored on load, so deletes need no bookkeeping here.
+// ---------------------------------------------------------------------------
+// export / import — the self-contained single-file format, for moving a project
+// between machines. Written and read in a streaming fashion for the same reason
+// legacyScan exists: the inlined form of a real project is bigger than a string.
+// ---------------------------------------------------------------------------
+
+/** The bytes behind a live node as a data URL, from wherever they are. */
+function nodeDataUrl(n: LiveNode): string {
+  const src = typeof n.src === 'string' ? n.src : ''
+  if (src.startsWith('data:')) return src
+  const ref = parseImgUrl(src)
+  if (!ref) return ''
+  const file = imgFileFor(ref.pid, ref.nid)
+  if (!file) return ''
+  const mime = MIME_BY_EXT[extOf(file)] ?? 'image/png'
+  return `data:${mime};base64,${readFileSync(file).toString('base64')}`
+}
+
+export function exportProject(p: LiveProject, filePath: string): void {
+  const fd = openSync(filePath, 'w')
+  try {
+    const head = { id: p.id, name: p.name, createdAt: p.createdAt, updatedAt: p.updatedAt }
+    writeSync(fd, JSON.stringify(head).slice(0, -1) + ',"images":[')
+    let i = 0
+    for (const n of p.images ?? []) {
+      const src = nodeDataUrl(n)
+      writeSync(fd, (i++ ? ',' : '') + JSON.stringify({ ...n, src }))
+    }
+    writeSync(fd, ']}')
+  } finally {
+    closeSync(fd)
+  }
+}
+
+/** Ingest an exported (or legacy) single-file project straight into the store.
+ *  Returns the project as the renderer needs it; nothing goes through the
+ *  renderer on the way in. */
+export async function importProject(filePath: string, onProgress?: Progress): Promise<LiveProject> {
+  const buf = readFileSync(filePath)
+  const scanned = scanLegacyProject(buf)
+  const head = JSON.parse(scanned.slim) as StoredProject
+  let id = isSafeId(head.id, true) ? head.id : uid()
+  let name = head.name
+  if (existsSync(projectDir(id)) || existsSync(legacyPath(id)) || readMeta(id)) {
+    id = uid()
+    name = `${name || 'Untitled'} (imported)`
+  }
+  const p = await ingestScanned(buf, scanned, id, { name }, onProgress)
+  return toLive(p)
+}
+
+// ---------------------------------------------------------------------------
+// sidebar order / prompts / settings — unchanged small files
+// ---------------------------------------------------------------------------
+
+// The sidebar order lives in its own file rather than as a field on each project.
+// This is a bare id list — ids that no longer exist are ignored on load, so
+// deletes need no bookkeeping here.
 function orderPath(): string {
   return join(app.getPath('userData'), 'projectOrder.json')
 }

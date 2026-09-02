@@ -7,10 +7,12 @@
          'wasm-unsafe-eval' is required by Remove BG (Precise): ONNX Runtime compiles its
          inference engine from WebAssembly, and a bare `script-src 'self'` blocks that — the
          compile throws and ORT reports the misleading "no available backend found". This is
-         the narrow directive: it permits WebAssembly only, and still forbids JS eval(). -->
+         the narrow directive: it permits WebAssembly only, and still forbids JS eval().
+         cf-img: is the app's own image store (main/pixels.ts): <img> paints from it, and
+         fetch() reads a node's original bytes from it when an operation needs the pixels. -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: cf-img:; connect-src 'self' cf-img:"
     />
   </head>
 

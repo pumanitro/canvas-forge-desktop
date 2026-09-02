@@ -19,7 +19,8 @@ export default defineConfig({
   renderer: {
     // Pin the dev renderer to its own port so it never collides with another Vite
     // project on the default 5173 (which would make Electron load the wrong app).
-    server: { port: 6771, strictPort: true },
+    // CANVAS_FORGE_RENDERER_PORT lets a second dev instance run beside the first.
+    server: { port: Number(process.env.CANVAS_FORGE_RENDERER_PORT) || 6771, strictPort: true },
     resolve: {
       alias: {
         '@renderer': resolve('src/renderer/src')

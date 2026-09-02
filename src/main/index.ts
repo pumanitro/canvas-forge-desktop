@@ -1,6 +1,6 @@
 import { app, shell, BrowserWindow, ipcMain, dialog, clipboard, nativeImage, Menu } from 'electron'
 import { join } from 'path'
-import { writeFileSync, readFileSync } from 'fs'
+import { writeFileSync } from 'fs'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { geminiGenerate, geminiDetect, geminiVariants, hasKey } from './gemini'
@@ -15,17 +15,34 @@ import {
   loadPrompts,
   addPrompt,
   getSettings,
-  setSetting
+  setSetting,
+  exportProject,
+  importProject,
+  type LiveProject
 } from './store'
+import { registerImageProtocol, registerImageScheme } from './pixels'
 import { ensureModel, matteInputSize, modelReady, runMatte, shutdownMatte, type ModelId } from './matte'
 import { registerMcpIpc, startMcpServer, stopMcpServer } from './mcp'
+
+// A second copy of the app beside the real one — for testing a branch against a
+// copy of a big project without touching the live instance or its files:
+//   CANVAS_FORGE_USER_DATA=/tmp/cf-test CANVAS_FORGE_DEBUG_PORT=9334 \
+//   CANVAS_FORGE_MCP_PORT=4831 CANVAS_FORGE_RENDERER_PORT=6772 npm run dev
+// Must run before anything reads the path (the single-instance lock does).
+if (process.env.CANVAS_FORGE_USER_DATA) {
+  app.setPath('userData', process.env.CANVAS_FORGE_USER_DATA)
+  app.setPath('sessionData', process.env.CANVAS_FORGE_USER_DATA)
+}
 
 // DEV ONLY: expose a Chrome DevTools Protocol endpoint so the app can be driven /
 // inspected/tested over CDP (like a browser tab). Never enabled in a packaged build.
 if (!app.isPackaged) {
-  app.commandLine.appendSwitch('remote-debugging-port', '9333')
+  app.commandLine.appendSwitch('remote-debugging-port', process.env.CANVAS_FORGE_DEBUG_PORT || '9333')
   app.commandLine.appendSwitch('remote-allow-origins', '*')
 }
+
+// cf-img:// (see pixels.ts) has to be declared before the app is ready.
+registerImageScheme()
 
 function createWindow(): void {
   const mainWindow = new BrowserWindow({
@@ -164,8 +181,14 @@ function registerIpc(): void {
 
   // --- projects / prompts / settings (files on disk) ---
   ipcMain.handle('projects:load', () => loadProjects())
-  ipcMain.handle('projects:loadOne', (_e, id: string) => loadProject(id))
-  ipcMain.handle('projects:save', (_e, p) => saveProject(p))
+  // A legacy single-file project is split into the new layout on its first open;
+  // the renderer shows the progress for the seconds that takes.
+  ipcMain.handle('projects:loadOne', (e, id: string) =>
+    loadProject(id, (done, total) => {
+      if (!e.sender.isDestroyed()) e.sender.send('projects:migrating', { id, done, total })
+    })
+  )
+  ipcMain.handle('projects:save', (_e, p: LiveProject) => saveProject(p))
   ipcMain.handle('projects:patchMeta', (_e, { id, patch }: { id: string; patch: { name?: string; updatedAt?: number; cover?: string } }) =>
     patchProjectMeta(id, patch)
   )
@@ -181,18 +204,25 @@ function registerIpc(): void {
   })
 
   // --- native file dialogs ---
-  ipcMain.handle('project:export', async (_e, project: { name?: string }) => {
+  // Export inlines every image from img/ so the file is self-contained; import
+  // splits such a file straight into the store. The renderer only ever sees the
+  // KB-sized layout on either side.
+  ipcMain.handle('project:export', async (_e, project: LiveProject) => {
     const { canceled, filePath } = await dialog.showSaveDialog({
       title: 'Export project',
       defaultPath: `${(project.name || 'project').replace(/[^a-z0-9-_ ]/gi, '_')}.cfproj.json`,
       filters: [{ name: 'Canvas Forge Project', extensions: ['json'] }]
     })
     if (canceled || !filePath) return { canceled: true }
-    writeFileSync(filePath, JSON.stringify(project))
+    try {
+      exportProject(project, filePath)
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : 'export failed' }
+    }
     return { path: filePath }
   })
 
-  ipcMain.handle('project:import', async () => {
+  ipcMain.handle('project:import', async (e) => {
     const { canceled, filePaths } = await dialog.showOpenDialog({
       title: 'Import project',
       properties: ['openFile'],
@@ -200,8 +230,12 @@ function registerIpc(): void {
     })
     if (canceled || !filePaths[0]) return { canceled: true }
     try {
-      return { project: JSON.parse(readFileSync(filePaths[0], 'utf8')) }
-    } catch {
+      const project = await importProject(filePaths[0], (done, total) => {
+        if (!e.sender.isDestroyed()) e.sender.send('projects:migrating', { id: 'import', done, total })
+      })
+      return { project }
+    } catch (err) {
+      console.error('[store] import failed:', err)
       return { error: 'Could not read that project file.' }
     }
   })
@@ -318,6 +352,7 @@ if (!app.requestSingleInstanceLock()) {
     if (process.platform === 'darwin' && !app.isPackaged) app.dock?.setIcon(icon)
     app.on('browser-window-created', (_, window) => optimizer.watchWindowShortcuts(window))
     buildAppMenu()
+    registerImageProtocol()
     registerIpc()
     registerMcpIpc()
     createWindow()
