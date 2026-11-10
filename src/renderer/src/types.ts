@@ -27,6 +27,18 @@ export type Project = {
   updatedAt: number
 }
 
+/** What the sidebar knows about a project without opening it. Comes from the
+ *  small `<id>.meta.json` sidecar, not the multi-hundred-MB project JSON. */
+export type ProjectSummary = {
+  id: string
+  name: string
+  createdAt: number
+  updatedAt: number
+  imageCount: number
+  /** Small WebP data URL of the mini-map, painted by the renderer on save. */
+  cover?: string
+}
+
 /** Selection rectangle in the natural-pixel space of a single image. */
 export type PixelBox = { x: number; y: number; w: number; h: number }
 

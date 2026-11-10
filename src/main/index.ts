@@ -6,7 +6,9 @@ import icon from '../../resources/icon.png?asset'
 import { geminiGenerate, geminiDetect, geminiVariants, hasKey } from './gemini'
 import {
   loadProjects,
+  loadProject,
   saveProject,
+  patchProjectMeta,
   deleteProject,
   loadProjectOrder,
   saveProjectOrder,
@@ -162,7 +164,11 @@ function registerIpc(): void {
 
   // --- projects / prompts / settings (files on disk) ---
   ipcMain.handle('projects:load', () => loadProjects())
+  ipcMain.handle('projects:loadOne', (_e, id: string) => loadProject(id))
   ipcMain.handle('projects:save', (_e, p) => saveProject(p))
+  ipcMain.handle('projects:patchMeta', (_e, { id, patch }: { id: string; patch: { name?: string; updatedAt?: number; cover?: string } }) =>
+    patchProjectMeta(id, patch)
+  )
   ipcMain.handle('projects:delete', (_e, id: string) => deleteProject(id))
   ipcMain.handle('projects:loadOrder', () => loadProjectOrder())
   ipcMain.handle('projects:saveOrder', (_e, ids: string[]) => saveProjectOrder(ids))

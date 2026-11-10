@@ -184,6 +184,57 @@ function keyOutMagenta(ctx: CanvasRenderingContext2D, w: number, h: number): voi
   ctx.putImageData(id, 0, 0)
 }
 
+// Repaint a magenta FRAME the model drew along the outer edge of an opaque result (it copies the
+// marker box back when that box lands on the border). Only the outer band is examined, and only
+// when the outermost ring is clearly magenta — so purple art, or a magenta accent that is
+// legitimately part of the picture, is left alone. Each rim pixel takes the colour of the first
+// non-magenta pixel straight inward from its edge, which continues the art to the border.
+function scrubMagentaRim(ctx: CanvasRenderingContext2D, w: number, h: number): void {
+  if (w < 8 || h < 8) return
+  const id = ctx.getImageData(0, 0, w, h)
+  const d = id.data
+  const magAt = (x: number, y: number): number => {
+    const i = (y * w + x) * 4
+    return Math.min(d[i], d[i + 2]) - d[i + 1]
+  }
+  // Gate: is the outermost ring actually a magenta frame? (real marker pixels score ~240)
+  let strong = 0
+  for (let x = 0; x < w; x++) {
+    if (magAt(x, 0) > 150) strong++
+    if (magAt(x, h - 1) > 150) strong++
+  }
+  for (let y = 1; y < h - 1; y++) {
+    if (magAt(0, y) > 150) strong++
+    if (magAt(w - 1, y) > 150) strong++
+  }
+  const ring = 2 * w + 2 * (h - 2) // pixels in the outermost ring
+  if (strong < ring * 0.25) return
+
+  const band = Math.max(4, Math.ceil(Math.min(w, h) * 0.04)) // how deep a rim we repaint
+  const reach = band * 3 // how far inward we look for clean art
+  const isRim = (x: number, y: number): boolean => magAt(x, y) > 50
+  const fix = (x: number, y: number, dx: number, dy: number): void => {
+    if (!isRim(x, y)) return
+    for (let k = 1; k <= reach; k++) {
+      const sx = x + dx * k
+      const sy = y + dy * k
+      if (sx < 0 || sy < 0 || sx >= w || sy >= h) return
+      if (isRim(sx, sy)) continue
+      const si = (sy * w + sx) * 4
+      const di = (y * w + x) * 4
+      d[di] = d[si]
+      d[di + 1] = d[si + 1]
+      d[di + 2] = d[si + 2]
+      return
+    }
+  }
+  for (let y = 0; y < band; y++) for (let x = 0; x < w; x++) fix(x, y, 0, 1) // top → look down
+  for (let y = h - band; y < h; y++) for (let x = 0; x < w; x++) fix(x, y, 0, -1) // bottom → up
+  for (let x = 0; x < band; x++) for (let y = 0; y < h; y++) fix(x, y, 1, 0) // left → right
+  for (let x = w - band; x < w; x++) for (let y = 0; y < h; y++) fix(x, y, -1, 0) // right → left
+  ctx.putImageData(id, 0, 0)
+}
+
 // Bleed the nearest fully-opaque colour outward into the semi-transparent EDGE band (up to a few
 // px), keeping each pixel's alpha. Kills the colour-contaminated fringe left when a subject is cut
 // off a coloured background — a magenta halo, or a light/white matte ring — without touching the
@@ -254,34 +305,58 @@ function extractPrompt(userPrompt?: string): string {
 
 // Prompt for a whole-card edit: the model regenerates the ENTIRE card in one pass and
 // changes ONLY the magenta-marked element, returning a complete, fully OPAQUE card.
+//
+// `fullFrame` ⇒ the selection IS the whole image. Then there is no marker box (drawing one would
+// put magenta on the outermost pixel rows, which the model copies back as a frame — see
+// imageEdit) and no "keep everything outside the same" (there is no outside): the instruction
+// simply applies to the whole image.
 function wholeCardEditPrompt(
   userPrompt: string,
   refCount: number,
-  r: { selX: number; selY: number; selW: number; selH: number; W: number; H: number }
+  r: { selX: number; selY: number; selW: number; selH: number; W: number; H: number },
+  fullFrame: boolean
 ): string {
   const pctX = Math.round((r.selX / r.W) * 100)
   const pctY = Math.round((r.selY / r.H) * 100)
   const pctW = Math.round((r.selW / r.W) * 100)
   const pctH = Math.round((r.selH / r.H) * 100)
   const lines = [
-    'You are editing one piece of game-UI CARD artwork. The LAST image is the FULL card to edit.',
-    'A MAGENTA RECTANGLE has been drawn on it to mark the ONE element you must change. The rectangle is only an annotation — NEVER draw it, or any magenta, in your output.'
+    'You are editing one piece of game-UI CARD artwork. The LAST image is the FULL card to edit.'
   ]
+  if (!fullFrame) {
+    lines.push(
+      'A MAGENTA RECTANGLE has been drawn on it to mark the ONE element you must change. The rectangle is only an annotation — NEVER draw it, or any magenta, in your output.'
+    )
+  }
   if (refCount > 0) {
     lines.push(
       'The image(s) before it are STYLE REFERENCES, letterboxed on dark padding (ignore the padding). Borrow ONLY the look the instruction asks for (palette, metal/gold finish, lighting, letterforms). Never copy their text, numbers, layout or objects.'
     )
   }
+  if (fullFrame) {
+    lines.push(
+      userPrompt.trim()
+        ? `Edit the WHOLE image exactly as follows: "${userPrompt.trim()}".`
+        : refCount > 0
+          ? 'Restyle the whole image to match the reference look.'
+          : 'Cleanly redraw the whole image.',
+      'Return the ENTIRE card as ONE coherent image at the SAME dimensions, aspect ratio and framing as the input. Apart from the requested change, keep the layout, silhouette, art style, metal, gem, banner, colours and lighting the same.'
+    )
+  } else {
+    lines.push(
+      userPrompt.trim()
+        ? `Change ONLY the marked element, exactly as follows: "${userPrompt.trim()}".`
+        : refCount > 0
+          ? 'Restyle ONLY the marked element to match the reference look.'
+          : 'Cleanly redraw ONLY the marked element so it fits the card.',
+      `The marked element is about ${pctW}% wide and ${pctH}% tall, positioned around ${pctX}% from the left and ${pctY}% from the top.`,
+      'Regenerate and return the ENTIRE card as ONE coherent image at the SAME dimensions, aspect ratio and framing as the input. Keep everything OUTSIDE the marked element visually the same — same layout, silhouette, art style, metal, gem, banner, colours and lighting — so ONLY the marked element changes.'
+    )
+  }
   lines.push(
-    userPrompt.trim()
-      ? `Change ONLY the marked element, exactly as follows: "${userPrompt.trim()}".`
-      : refCount > 0
-        ? 'Restyle ONLY the marked element to match the reference look.'
-        : 'Cleanly redraw ONLY the marked element so it fits the card.',
-    `The marked element is about ${pctW}% wide and ${pctH}% tall, positioned around ${pctX}% from the left and ${pctY}% from the top.`,
-    'Regenerate and return the ENTIRE card as ONE coherent image at the SAME dimensions, aspect ratio and framing as the input. Keep everything OUTSIDE the marked element visually the same — same layout, silhouette, art style, metal, gem, banner, colours and lighting — so ONLY the marked element changes.',
     'The output MUST be FULLY OPAQUE: paint every pixel. No transparency, no alpha, no see-through or empty areas — render any inner window or panel as solid painted artwork.',
     'Match the art style, lighting, colour temperature, palette and materials across the whole card so the edit is seamless: no visible boundary, box, outline, seam, halo, glow or blur.',
+    'Do NOT add any border, frame, outline, coloured edge or margin around the image: the artwork must reach the very edge of the frame exactly as it does in the input.',
     'Output ONLY the final full card image.'
   )
   return lines.join('\n')
@@ -310,17 +385,35 @@ export async function imageEdit(p: {
   const region = { selX, selY, selW, selH }
   const refs = (p.references || []).slice(0, 4)
 
-  // The full card with a magenta marker box drawn around the element to change.
+  // A selection that (nearly) covers the whole image is a whole-image edit. The marker box
+  // would then sit ON the outermost pixel rows, where it is indistinguishable from an image
+  // border — and the model dutifully paints that magenta frame back into its output (seen as a
+  // 2px purple rim on every full-card Generate). So: no box, whole-image prompt instead.
+  const fullFrame = selW >= W * 0.95 && selH >= H * 0.95
+
+  // The full card, with a magenta marker box drawn around the element to change (unless the
+  // element IS the card). The box is kept clear of the image edge by a stroke width on every
+  // side, so even a selection that touches the border never puts magenta on the outer rows.
   const ann = makeCanvas(W, H)
   ann.ctx.drawImage(img, 0, 0)
-  ann.ctx.strokeStyle = '#FF00FF'
-  ann.ctx.lineWidth = Math.max(3, Math.round(Math.min(W, H) * 0.006))
-  ann.ctx.strokeRect(selX, selY, selW, selH)
+  if (!fullFrame) {
+    const lw = Math.max(3, Math.round(Math.min(W, H) * 0.006))
+    const inset = lw * 1.5 // stroke is centred on the path: half inside + a full width of clear art
+    const x0 = Math.max(selX, inset)
+    const y0 = Math.max(selY, inset)
+    const x1 = Math.min(selX + selW, W - inset)
+    const y1 = Math.min(selY + selH, H - inset)
+    if (x1 - x0 >= lw && y1 - y0 >= lw) {
+      ann.ctx.strokeStyle = '#FF00FF'
+      ann.ctx.lineWidth = lw
+      ann.ctx.strokeRect(x0, y0, x1 - x0, y1 - y0)
+    }
+  }
 
   // Style refs are letterboxed to the card's aspect (else they reshape the output); card LAST.
   const paddedRefs = await Promise.all(refs.map((r) => padToAspect(r, W, H)))
   const genUrl = await gemini(
-    wholeCardEditPrompt(p.prompt, refs.length, { ...region, W, H }),
+    wholeCardEditPrompt(p.prompt, refs.length, { ...region, W, H }, fullFrame),
     p.model,
     [...paddedRefs, ann.cv.toDataURL('image/png')]
   )
@@ -329,6 +422,10 @@ export async function imageEdit(p: {
   // Use the model's whole coherent card, scaled to the exact original dimensions — opaque.
   const out = makeCanvas(W, H)
   out.ctx.drawImage(gen, 0, 0, W, H)
+
+  // Safety net: should the model still hand back a magenta frame, repaint it from the art just
+  // inside it. Gated on a real rim being present, so ordinary edges are never touched.
+  scrubMagentaRim(out.ctx, W, H)
 
   // Lock the palette to the original (via the unchanged surroundings) on reference-free edits,
   // so a localized change can't drift the whole card's tone. Skip for ref-driven restyles.

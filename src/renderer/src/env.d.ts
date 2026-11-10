@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 
-import type { Project } from './types'
+import type { Project, ProjectSummary } from './types'
 
 // Bundled style-guide reference art, inlined as a base64 data URL at build time.
 declare module '*.png?inline' {
@@ -17,8 +17,10 @@ declare global {
         note?: string
         error?: string
       }>
-      loadProjects: () => Promise<Project[]>
+      loadProjects: () => Promise<ProjectSummary[]>
+      loadProject: (id: string) => Promise<Project | null>
       saveProject: (p: Project) => Promise<unknown>
+      patchProjectMeta: (id: string, patch: { name?: string; updatedAt?: number; cover?: string }) => Promise<ProjectSummary | null>
       deleteProject: (id: string) => Promise<unknown>
       loadProjectOrder: () => Promise<string[]>
       saveProjectOrder: (ids: string[]) => Promise<unknown>
